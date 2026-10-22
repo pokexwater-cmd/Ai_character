@@ -7,14 +7,14 @@ const app = express(); app.use(express.static(path.join(__dirname, 'public')));
 const server = http.createServer(app), wss = new WebSocketServer({ server });
 
 // ---- memory: Supabase table `memories`; falls back to RAM when SUPABASE_URL / SUPABASE_KEY are not set ----
-const SB = E.SUPABASE_URL && E.SUPABASE_KEY, ram = { fact: [], chat: [] };
+const SB = E.SUPABASE_URL && E.SUPABASE_KEY, ram = { fact: [], chat: [], lesson: [], skill: [], summary: [] };
 const sb = (p, o = {}) => fetch(E.SUPABASE_URL + '/rest/v1/' + p, { ...o, headers: { apikey: E.SUPABASE_KEY, Authorization: 'Bearer ' + E.SUPABASE_KEY, 'Content-Type': 'application/json', Prefer: 'return=minimal' } });
 async function load(kind, n) {
-  if (!SB) return ram[kind].slice(-n);
-  try { const r = await sb(`memories?kind=eq.${kind}&select=content&order=id.desc&limit=${n}`); return (await r.json()).map(x => x.content).reverse(); } catch (e) { return ram[kind].slice(-n); }
+  if (!SB) return (ram[kind] || []).slice(-n);
+  try { const r = await sb(`memories?kind=eq.${kind}&select=content&order=id.desc&limit=${n}`); return (await r.json()).map(x => x.content).reverse(); } catch (e) { return (ram[kind] || []).slice(-n); }
 }
 async function save(kind, content) {
-  ram[kind].push(content); if (ram[kind].length > 200) ram[kind].shift();
+  (ram[kind] = ram[kind] || []).push(content); if (ram[kind].length > 200) ram[kind].shift();
   if (SB) try { await sb('memories', { method: 'POST', body: JSON.stringify({ kind, content }) }); } catch (e) {}
 }
 
@@ -108,7 +108,7 @@ wss.on('connection', (ws, req) => {
     let m; try { m = JSON.parse(d); } catch (e) { return; }
     const now = Date.now(), gap = m.type === 'user' ? 1500 : 60000;   // limits: his own thinking at most once a minute, a chat message every 1.5 s (saves the free quota)
     if (now - last < gap) return ws.send(JSON.stringify({})); last = now;
-    try { ws.send(JSON.stringify(await think(m, ws))); } catch (e) { ws.send(JSON.stringify({})); }
+    try { ws.send(JSON.stringify(await think(m, ws))); } catch (e) { console.log('think crashed:', e.stack.split('\n').slice(0, 3).join(' | ')); ws.send(JSON.stringify({ status: 'error', detail: 'server bug: ' + String(e.message).slice(0, 80) })); }   // errors now show on screen instead of silence
   });
 });
 setInterval(() => wss.clients.forEach(w => { if (!w.alive) return w.terminate(); w.alive = false; w.ping(); }), 30000);   // keeps Render from dropping the socket
