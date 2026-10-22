@@ -18,7 +18,14 @@ async function save(kind, content) {
   if (SB) try { await sb('memories', { method: 'POST', body: JSON.stringify({ kind, content }) }); } catch (e) {}
 }
 
-// ---- AI providers: Gemini first, OpenRouter as fallback (set whichever keys you have) ----
+// ---- AI providers: Groq first, Gemini + OpenRouter as fallbacks (set whichever keys you have) ----
+async function groq(sys, user) {
+  const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + E.GROQ_API_KEY },
+    body: JSON.stringify({ model: E.GROQ_MODEL || 'llama-3.3-70b-versatile', temperature: 0.9, max_tokens: 500, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: sys }, { role: 'user', content: user }] }) });
+  const j = await r.json(); if (!r.ok) throw new Error(JSON.stringify(j).slice(0, 200));
+  return j.choices[0].message.content;
+}
 async function gemini(sys, user) {
   const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${E.GEMINI_MODEL || 'gemini-2.5-flash'}:generateContent?key=${E.GEMINI_API_KEY}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -33,7 +40,7 @@ async function openrouter(sys, user) {
   const j = await r.json(); if (!r.ok) throw new Error(JSON.stringify(j).slice(0, 200));
   return j.choices[0].message.content;
 }
-const providers = [E.GEMINI_API_KEY && gemini, E.OPENROUTER_API_KEY && openrouter].filter(Boolean);
+const providers = [E.GROQ_API_KEY && groq, E.GEMINI_API_KEY && gemini, E.OPENROUTER_API_KEY && openrouter].filter(Boolean);   // Groq first, then Gemini, then OpenRouter
 
 // ---- think: build the prompt from persona + memory + what he sees, get {say, mood, actions, remember} ----
 let used = 0, day = new Date().getUTCDate();
