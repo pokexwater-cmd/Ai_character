@@ -22,7 +22,7 @@ async function save(kind, content) {
 async function gemini(sys, user) {
   const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${E.GEMINI_MODEL || 'gemini-2.5-flash'}:generateContent?key=${E.GEMINI_API_KEY}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ systemInstruction: { parts: [{ text: sys }] }, contents: [{ role: 'user', parts: [{ text: user }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.9, maxOutputTokens: 800 } }) });
+    body: JSON.stringify({ systemInstruction: { parts: [{ text: sys }] }, contents: [{ role: 'user', parts: [{ text: user }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.9, maxOutputTokens: 1500 } }) });
   const j = await r.json(); if (!r.ok) throw new Error(JSON.stringify(j).slice(0, 200));
   return j.candidates[0].content.parts.map(p => p.text || '').join('');
 }
@@ -37,7 +37,7 @@ const providers = [E.GEMINI_API_KEY && gemini, E.OPENROUTER_API_KEY && openroute
 
 // ---- think: build the prompt from persona + memory + what he sees, get {say, mood, actions, remember} ----
 let used = 0, day = new Date().getUTCDate();
-const MOODS = ['neutral', 'happy', 'sad', 'angry', 'surprised', 'smirk'], DOS = ['walk', 'run', 'come', 'face', 'wait', 'stop'];
+const MOODS = ['neutral', 'happy', 'sad', 'angry', 'surprised', 'smirk'], DOS = ['walk', 'run', 'come', 'face', 'wait', 'stop', 'turn'];
 async function think(msg, ws) {
   const prog = t => { try { ws.send(JSON.stringify({ progress: t })); } catch (e) {} };   // live status for the screen
   if (new Date().getUTCDate() !== day) { day = new Date().getUTCDate(); used = 0; }
@@ -45,18 +45,18 @@ async function think(msg, ws) {
   if (used >= DAILY) return { status: 'error', detail: 'daily limit reached' };
   used++; prog('thinking...');
   const [facts, chat] = await Promise.all([load('fact', 15), load('chat', 12)]), s = msg.state || {};
-  const sys = `${PERSONA}\n\nThings you remember:\n${facts.map(f => '- ' + f).join('\n') || '(nothing yet)'}\n\nRecent conversation:\n${chat.join('\n') || '(none)'}\n\nReply with ONLY JSON: {"say":"a short message or empty string","mood":"${MOODS.join('|')}","actions":[...],"remember":"one short fact worth keeping, or empty string"}\nActions run in order, each finishes before the next: {"do":"walk","x":n,"z":n} {"do":"run","x":n,"z":n} {"do":"come"} {"do":"face"} {"do":"wait","s":n} {"do":"stop"}. x and z are metres and must stay within ${s.bounds || 58} of 0,0. Be human: usually 0-3 actions, under 15 words, you do not have to talk every turn, pauses and wandering off are natural.`;
+  const sys = `${PERSONA}\n\nThings you remember:\n${facts.map(f => '- ' + f).join('\n') || '(nothing yet)'}\n\nRecent conversation:\n${chat.join('\n') || '(none)'}\n\nReply with ONLY JSON: {"say":"a short message or empty string","mood":"${MOODS.join('|')}","actions":[...],"remember":"one short fact worth keeping, or empty string"}\nActions run in order, each finishes before the next: {"do":"walk","x":n,"z":n} {"do":"run","x":n,"z":n} {"do":"come"} {"do":"face"} {"do":"turn","deg":n} {"do":"wait","s":n} {"do":"stop"}. face = turn towards the player; turn = rotate on the spot by n degrees (180 = turn around, 90 = quarter turn). x and z are metres and must stay within ${s.bounds || 58} of 0,0. Be human: usually 0-3 actions, under 15 words, you do not have to talk every turn, pauses and wandering off are natural.`;
   const who = msg.type === 'user' ? `The player says: "${String(msg.text).slice(0, 300)}"` : 'Nothing was said. Time passed. Do whatever you feel like (or nothing).';
   let raw = '', err = '';
   outer: for (const p of providers) {
-    for (let i = 0; i < 4; i++) {   // a busy model (503 / 429) is retried a few times before giving up on this provider
+    for (let i = 0; i < 2; i++) {   // a busy model (503 / 429) gets one quick retry, then the next provider (OpenRouter) takes over
       try { raw = await p(sys, `${who}\nState: ${JSON.stringify(s)}`); console.log('ai ok:', p.name); break outer; }
-      catch (e) { err = e.message; console.log('provider failed:', p.name, e.message.slice(0, 120)); if (!/503|429|UNAVAILABLE|overloaded/i.test(e.message)) break; prog('AI busy, retry ' + (i + 1)); await new Promise(r => setTimeout(r, 1500 * (i + 1))); }
+      catch (e) { err = e.message; console.log('provider failed:', p.name, e.message.slice(0, 120)); if (!/503|429|UNAVAILABLE|overloaded/i.test(e.message)) break; prog('AI busy, retry ' + (i + 1)); await new Promise(r => setTimeout(r, 1000)); }
     }
   }
   if (!raw) return { status: 'error', detail: 'AI unreachable: ' + (/503|UNAVAILABLE/i.test(err) ? 'busy' : /404/.test(err) ? 'model name rejected' : /40[13]|API key/i.test(err) ? 'key rejected' : err.slice(0, 60)) };
-  let o = {}; try { o = JSON.parse(raw.replace(/```json|```/g, '').trim()); } catch (e) { return { status: 'error', detail: 'AI sent an unreadable reply' }; }
-  const acts = (Array.isArray(o.actions) ? o.actions : []).filter(a => a && DOS.includes(a.do)).slice(0, 5).map(a => ({ do: a.do, x: +a.x || 0, z: +a.z || 0, s: Math.min(10, +a.s || 1) }));
+  let o = {}; try { const j = raw.match(/\{[\s\S]*\}/); o = JSON.parse(j ? j[0] : raw); } catch (e) { if (raw.indexOf('{') < 0) o = { say: raw.trim() }; else return { status: 'error', detail: 'AI sent an unreadable reply' }; }   // pulls the JSON out of any extra text; plain text becomes his speech
+  const acts = (Array.isArray(o.actions) ? o.actions : []).filter(a => a && DOS.includes(a.do)).slice(0, 5).map(a => ({ do: a.do, x: +a.x || 0, z: +a.z || 0, s: Math.min(10, +a.s || 1), deg: +a.deg || 0 }));
   const say = typeof o.say === 'string' ? o.say.slice(0, 140) : '', mood = MOODS.includes(o.mood) ? o.mood : 'neutral';
   if (msg.type === 'user') await save('chat', 'Player: ' + String(msg.text).slice(0, 200));
   if (say) await save('chat', NAME + ': ' + say);
