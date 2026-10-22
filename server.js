@@ -22,7 +22,7 @@ async function save(kind, content) {
 const groqCall = key => async (sys, user) => {
   const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
-    body: JSON.stringify({ model: E.GROQ_MODEL || 'llama-3.3-70b-versatile', temperature: 0.9, max_tokens: 500, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: sys }, { role: 'user', content: user }] }) });
+    body: JSON.stringify({ model: E.GROQ_MODEL || 'openai/gpt-oss-20b', temperature: 0.9, max_tokens: 1200, reasoning_effort: 'low', response_format: { type: 'json_object' }, messages: [{ role: 'system', content: sys }, { role: 'user', content: user }] }) });
   const j = await r.json(); if (!r.ok) throw new Error(JSON.stringify(j).slice(0, 200));
   return j.choices[0].message.content;
 };
