@@ -47,14 +47,14 @@ async function think(msg, ws) {
   const [facts, chat] = await Promise.all([load('fact', 15), load('chat', 12)]), s = msg.state || {};
   const sys = `${PERSONA}\n\nThings you remember:\n${facts.map(f => '- ' + f).join('\n') || '(nothing yet)'}\n\nRecent conversation:\n${chat.join('\n') || '(none)'}\n\nReply with ONLY JSON: {"say":"a short message or empty string","mood":"${MOODS.join('|')}","actions":[...],"remember":"one short fact worth keeping, or empty string"}\nActions run in order, each finishes before the next: {"do":"walk","x":n,"z":n} {"do":"run","x":n,"z":n} {"do":"come"} {"do":"face"} {"do":"turn","deg":n} {"do":"wait","s":n} {"do":"stop"}. face = turn towards the player; turn = rotate on the spot by n degrees (180 = turn around, 90 = quarter turn). x and z are metres and must stay within ${s.bounds || 58} of 0,0. Be human: usually 0-3 actions, under 15 words, you do not have to talk every turn, pauses and wandering off are natural.`;
   const who = msg.type === 'user' ? `The player says: "${String(msg.text).slice(0, 300)}"` : 'Nothing was said. Time passed. Do whatever you feel like (or nothing).';
-  let raw = '', err = '';
+  let raw = '', err = '', errs = [];
   outer: for (const p of providers) {
     for (let i = 0; i < 2; i++) {   // a busy model (503 / 429) gets one quick retry, then the next provider (OpenRouter) takes over
       try { raw = await p(sys, `${who}\nState: ${JSON.stringify(s)}`); console.log('ai ok:', p.name); break outer; }
-      catch (e) { err = e.message; console.log('provider failed:', p.name, e.message.slice(0, 120)); if (!/503|429|UNAVAILABLE|overloaded/i.test(e.message)) break; prog('AI busy, retry ' + (i + 1)); await new Promise(r => setTimeout(r, 1000)); }
+      catch (e) { err = e.message; if (errs.length < 3 && i === 0 || !/503|429|UNAVAILABLE|overloaded/i.test(e.message)) errs.push(p.name + ': ' + (/429|quota|RESOURCE_EXHAUSTED|rate limit/i.test(e.message) ? 'quota / rate limit used up' : /503|UNAVAILABLE|overloaded/i.test(e.message) ? 'busy' : /404/.test(e.message) ? 'model name rejected' : /40[13]|API key|auth/i.test(e.message) ? 'key rejected' : e.message.slice(0, 50))); console.log('provider failed:', p.name, e.message.slice(0, 120)); if (!/503|429|UNAVAILABLE|overloaded/i.test(e.message)) break; prog('AI busy, retry ' + (i + 1)); await new Promise(r => setTimeout(r, 1000)); }
     }
   }
-  if (!raw) return { status: 'error', detail: 'AI unreachable: ' + (/503|UNAVAILABLE/i.test(err) ? 'busy' : /404/.test(err) ? 'model name rejected' : /40[13]|API key/i.test(err) ? 'key rejected' : err.slice(0, 60)) };
+  if (!raw) return { status: 'error', detail: errs.join(' | ') || 'AI unreachable' };
   let o = {}; try { const j = raw.match(/\{[\s\S]*\}/); o = JSON.parse(j ? j[0] : raw); } catch (e) { if (raw.indexOf('{') < 0) o = { say: raw.trim() }; else return { status: 'error', detail: 'AI sent an unreadable reply' }; }   // pulls the JSON out of any extra text; plain text becomes his speech
   const acts = (Array.isArray(o.actions) ? o.actions : []).filter(a => a && DOS.includes(a.do)).slice(0, 5).map(a => ({ do: a.do, x: +a.x || 0, z: +a.z || 0, s: Math.min(10, +a.s || 1), deg: +a.deg || 0 }));
   const say = typeof o.say === 'string' ? o.say.slice(0, 140) : '', mood = MOODS.includes(o.mood) ? o.mood : 'neutral';
@@ -69,7 +69,7 @@ wss.on('connection', (ws, req) => {
   let last = 0; ws.alive = true; ws.on('pong', () => ws.alive = true);
   ws.on('message', async d => {
     let m; try { m = JSON.parse(d); } catch (e) { return; }
-    const now = Date.now(), gap = m.type === 'user' ? 1500 : 15000;   // limits: a tick at most every 15 s, a chat message every 1.5 s
+    const now = Date.now(), gap = m.type === 'user' ? 1500 : 60000;   // limits: his own thinking at most once a minute, a chat message every 1.5 s (saves the free quota)
     if (now - last < gap) return ws.send(JSON.stringify({})); last = now;
     try { ws.send(JSON.stringify(await think(m, ws))); } catch (e) { ws.send(JSON.stringify({})); }
   });
