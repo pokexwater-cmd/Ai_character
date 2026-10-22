@@ -19,13 +19,13 @@ async function save(kind, content) {
 }
 
 // ---- AI providers: Groq first, Gemini + OpenRouter as fallbacks (set whichever keys you have) ----
-async function groq(sys, user) {
+const groqCall = key => async (sys, user) => {
   const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + E.GROQ_API_KEY },
+    method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
     body: JSON.stringify({ model: E.GROQ_MODEL || 'llama-3.3-70b-versatile', temperature: 0.9, max_tokens: 500, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: sys }, { role: 'user', content: user }] }) });
   const j = await r.json(); if (!r.ok) throw new Error(JSON.stringify(j).slice(0, 200));
   return j.choices[0].message.content;
-}
+};
 async function gemini(sys, user) {
   const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${E.GEMINI_MODEL || 'gemini-2.5-flash'}:generateContent?key=${E.GEMINI_API_KEY}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -40,7 +40,17 @@ async function openrouter(sys, user) {
   const j = await r.json(); if (!r.ok) throw new Error(JSON.stringify(j).slice(0, 200));
   return j.choices[0].message.content;
 }
-const providers = [E.GROQ_API_KEY && groq, E.GEMINI_API_KEY && gemini, E.OPENROUTER_API_KEY && openrouter].filter(Boolean);   // Groq first, then Gemini, then OpenRouter
+// every env var starting with GROQ_API_KEY is a Groq key (GROQ_API_KEY, GROQ_API_KEY_2, GROQ_API_KEY_3 ...); a comma list in one var also works
+const groqKeys = Object.keys(E).filter(k => /^GROQ_API_KEY/i.test(k)).sort().flatMap(k => String(E[k]).split(',')).map(k => k.trim()).filter(Boolean);
+// ORDER: every Groq key first -> OpenRouter -> Gemini only as the very last option
+const providers = [
+  ...groqKeys.map((k, n) => ({ name: 'groq#' + (n + 1), fn: groqCall(k) })),
+  ...(E.OPENROUTER_API_KEY ? [{ name: 'openrouter', fn: openrouter }] : []),
+  ...(E.GEMINI_API_KEY ? [{ name: 'gemini', fn: gemini }] : []),
+];
+const cool = {};   // provider name -> time until which it rests after hitting a limit
+const rest = (name, msg) => { cool[name] = Date.now() + (/per day|daily|TPD|RPD/i.test(msg) ? 30 * 60000 : /40[13]|invalid|does not exist|access/i.test(msg) ? 10 * 60000 : 65000); };
+console.log('providers in order:', providers.map(p => p.name).join(' > ') || 'none');
 
 // ---- think: build the prompt from persona + memory + what he sees, get {say, mood, actions, remember} ----
 let used = 0, day = new Date().getUTCDate();
@@ -55,10 +65,14 @@ async function think(msg, ws) {
   const sys = `${PERSONA}\n\nThings you remember:\n${facts.map(f => '- ' + f).join('\n') || '(nothing yet)'}\n\nRecent conversation:\n${chat.join('\n') || '(none)'}\n\nReply with ONLY JSON: {"say":"a short message or empty string","mood":"${MOODS.join('|')}","actions":[...],"remember":"one short fact worth keeping, or empty string"}\nActions run in order, each finishes before the next: {"do":"walk","x":n,"z":n} {"do":"run","x":n,"z":n} {"do":"come"} {"do":"face"} {"do":"turn","deg":n} {"do":"wait","s":n} {"do":"stop"}. face = turn towards the player; turn = rotate on the spot by n degrees (180 = turn around, 90 = quarter turn). x and z are metres and must stay within ${s.bounds || 58} of 0,0. Be human: usually 0-3 actions, under 15 words, you do not have to talk every turn, pauses and wandering off are natural.`;
   const who = msg.type === 'user' ? `The player says: "${String(msg.text).slice(0, 300)}"` : 'Nothing was said. Time passed. Do whatever you feel like (or nothing).';
   let raw = '', err = '', errs = [];
-  outer: for (const p of providers) {
-    for (let i = 0; i < 2; i++) {   // a busy model (503 / 429) gets one quick retry, then the next provider (OpenRouter) takes over
-      try { raw = await p(sys, `${who}\nState: ${JSON.stringify(s)}`); console.log('ai ok:', p.name); break outer; }
-      catch (e) { err = e.message; if (errs.length < 3 && i === 0 || !/503|429|UNAVAILABLE|overloaded/i.test(e.message)) errs.push(p.name + ': ' + (/429|quota|RESOURCE_EXHAUSTED|rate limit/i.test(e.message) ? 'quota / rate limit used up' : /503|UNAVAILABLE|overloaded/i.test(e.message) ? 'busy' : /404/.test(e.message) ? 'model name rejected' : /40[13]|API key|auth/i.test(e.message) ? 'key rejected' : e.message.slice(0, 50))); console.log('provider failed:', p.name, e.message.slice(0, 120)); if (!/503|429|UNAVAILABLE|overloaded/i.test(e.message)) break; prog('AI busy, retry ' + (i + 1)); await new Promise(r => setTimeout(r, 1000)); }
+  const now0 = Date.now(), ready = providers.filter(p => (cool[p.name] || 0) <= now0), order = ready.length ? ready : providers;   // skip resting providers; if all rest, try them all anyway
+  const why = m => /429|quota|RESOURCE_EXHAUSTED|rate limit/i.test(m) ? 'quota / rate limit used up' : /503|UNAVAILABLE|overloaded/i.test(m) ? 'busy' : /404|does not exist|not have access/i.test(m) ? 'model name rejected' : /40[13]|API key|auth/i.test(m) ? 'key rejected' : m.slice(0, 60);
+  outer: for (const p of order) {
+    for (let i = 0; i < 2; i++) {   // a busy server (503) gets one quick retry; a rate limit moves straight to the next provider
+      try { raw = await p.fn(sys, `${who}\nState: ${JSON.stringify(s)}`); console.log('ai ok:', p.name); break outer; }
+      catch (e) { err = e.message; console.log('provider failed:', p.name, e.message.slice(0, 120));
+        if (/503|UNAVAILABLE|overloaded/i.test(e.message) && !/429|quota|rate limit/i.test(e.message) && i === 0) { prog('AI busy, retry'); await new Promise(r => setTimeout(r, 800)); continue; }
+        errs.push(p.name + ': ' + why(e.message)); rest(p.name, e.message); break; }
     }
   }
   if (!raw) return { status: 'error', detail: errs.join(' | ') || 'AI unreachable' };
