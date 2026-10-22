@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>AI Character World</title>
+<style>
+  html, body { margin:0; padding:0; overflow:hidden; background:#000; touch-action:none; }
+  #hud { position:fixed; top:10px; left:10px; z-index:10; color:#fff; font:13px/1.4 system-ui, sans-serif;
+    background:rgba(0,0,0,0.45); padding:8px 12px; border-radius:8px; }
+  #hud b { color:#ffd76b; }
+  #hud input { vertical-align:middle; width:110px; }
+  #hint2 { position:absolute; top:70px; left:50%; transform:translateX(-50%); color:#fff; background:rgba(0,0,0,0.5);
+    padding:6px 12px; border-radius:8px; font:12px system-ui, sans-serif; text-align:center; pointer-events:none; z-index:10; transition:opacity 0.5s; }
+  #joyZone { position:absolute; left:0; bottom:0; width:45vw; height:45vh; z-index:5; touch-action:none; }
+  #joyBase { position:absolute; width:100px; height:100px; border-radius:50%; background:rgba(20,20,20,0.35);
+    border:3px solid rgba(255,255,255,0.55); display:none; pointer-events:none; }
+  #joyStick { position:absolute; width:46px; height:46px; border-radius:50%; background:rgba(255,255,255,0.75);
+    border:2px solid rgba(0,0,0,0.25); box-shadow:0 2px 6px rgba(0,0,0,0.4); pointer-events:none; }
+  #chat { position:fixed; left:50%; bottom:12px; transform:translateX(-50%); width:min(92vw,440px); z-index:20; font:13px/1.4 system-ui,sans-serif; }
+  #chatLog { color:#fff; background:rgba(0,0,0,0.4); border-radius:8px; padding:4px 10px; margin-bottom:6px; max-height:96px; overflow:hidden; display:none; }
+  #chatIn { width:100%; box-sizing:border-box; padding:9px 12px; border-radius:8px; border:1px solid rgba(255,255,255,0.5); background:rgba(0,0,0,0.55); color:#fff; font-size:16px; outline:none; }
+  #chatIn:focus { border-color:#ffd76b; }
+  #lookZone { position:absolute; right:0; bottom:0; width:55vw; height:100vh; z-index:4; touch-action:none; }
+</style>
+</head>
+<body>
+<div id="hud"><div><b>AI Character World</b> &middot; AI: <span id="aiState">idle</span> &middot; Brain: <span id="brainState">starting</span></div>
+  <div>Look sensitivity <input type="range" id="sens" min="0.3" max="3" step="0.05" value="1"></div></div>
+<div id="hint2">WASD / joystick to walk &middot; drag or mouse to look &middot; type below to talk to him</div>
+<div id="chat"><div id="chatLog"></div><input id="chatIn" placeholder="Say something..." autocomplete="off" maxlength="300"></div>
+<div id="joyZone"><div id="joyBase"></div><div id="joyStick"></div></div>
+<div id="lookZone"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+/* =====================================================================
+   AI CHARACTER WORLD — a base world + a character an AI will drive.
+   Factories (each one self-contained):
+     WorldFactory     ground, sky, fog, lights        (from Cover Drive)
+     JoystickFactory  WASD + touch joystick input     (from Cover Drive)
+     CameraFactory    first-person look + sensitivity (from Cover Drive)
+     RigFactory       the character in the 3D world   (bridge for the Catch Factory rig)
+     AIPlayerFactory  action executor (the server brain tells it what to do)
+     SayFactory       text bubble above his head
+     BrainFactory     WebSocket link to the server brain + the chat box
+   Below: HumanMotion + HumanRigFactory + JerseyFactory copied verbatim from Catch Factory 138.
+   ===================================================================== */
+
+const CONFIG = { tilt: 0.12, zoom: 1 };   // the rig's draw() reads these two (low tilt = seen almost side-on, like a person standing in the world)
+
+/* ---------- Catch Factory 138: HumanMotion (clips: idle / walk / run) ---------- */
+const HumanMotion = {
+  clips: {
+    idle: { cps: 0,    duty: 0.6,  stride: 0,  lift: 0,  lean: 0,    headKeep: 0,   bob: 0.35, sway: 0,   twist: 0,    armAmp: 0,    armBend: 0.1, crouch: 0 },
+    walk: { cps: 1.6, duty: 0.62, stride: 19, lift: 4, lean: 0,    headKeep: 0,   bob: 1.0,  sway: 0.9, twist: 0.14, armAmp: 0.55, armBend: 0.15, crouch: 0 },
+    run:  { cps: 2.3,  duty: 0.4,  stride: 22, lift: 11, lean: 0.38, headKeep: 0.6, bob: 1.8,  sway: 0.5, twist: 0.2,  armAmp: 0.95, armBend: 1,   crouch: 0.8, run: 1 }
+  },
+  get(name){ return this.clips[name] || this.clips[name === 'sprint' ? 'run' : 'idle']; },
+  foot(ph, s, lift, duty){ duty = duty || 0.6; ph -= Math.floor(ph); if (ph < duty) return [s * (0.5 - ph / duty), 0]; const v = (ph - duty) / (1 - duty); return [s * (-0.5 + v), lift * Math.sin(Math.PI * v)]; },   // [forward offset, height]: slide back on the ground, then swing forward through the air
+  bounce(cl, cyc, t){ return cl.cps ? (cl.run ? -1 : 1) * Math.cos(Math.PI * 4 * (cyc - cl.duty / 2)) * cl.bob : Math.sin(t * 2) * cl.bob; },   // walk: highest at mid-stance / run: lowest at mid-stance, highest in the flight
+  armAngle(cl, cyc, sd){ return Math.cos(Math.PI * 2 * (cyc + (sd < 0 ? 0.5 : 0) - 0.04)) * cl.armAmp; }   // + = swung forward; each arm swings with the OPPOSITE leg
+};
+
+/* ---------- inert stand-ins for the cricket systems the rig's draw() has hooks for ---------- */
+const BatFactory = { M: null, _al: 0, spec: { stanceSpread: 0 }, has: () => false, blend: () => 0, clip: c => c, hand: () => null, begin(){}, got: () => false, render(){} };
+const ShotFactory = { pose: () => null, clip: c => c };
+const ShotFlowFactory = { cfg: { headFollow: 0.75 } };
+const FielderMotion = { pose: () => null, clip: c => c, hand: () => null, clips: {} };
+const BowlingMotion = { pose: () => null, clip: c => c, hand: () => null, sF: () => 0 };
+const BallFactory = { R: 3, sphere(){} };
+const FootworkFactory = { body: () => null };
+
+/* ---------- Catch Factory 138: HumanRigFactory + JerseyFactory ---------- */
+const HumanRigFactory = {
+  radius: 12, size: 2.6, diag: true, speedMul: 1, tagLift: 20, lodAt: 1.3,   // lodAt: below this on-screen scale (zoom x size) the cheap look is used; raise it for a wider cheap range, 0 = always full detail
+  defaults: {
+    height: 1, legLen: 1, torsoLen: 1, armLen: 1, shoulderW: 1, hipW: 1, bodyW: 1, bodyD: 1, belly: 0, limbThick: 1, headSize: 1, neckLen: 1, handSize: 1, footSize: 1,
+    skin: '#e3ae86', shirt: '#2f6fd0', pants: '#2a3350', shoes: '#17171c', hair: '#2b1a10', eyeColor: '#2a1a10', hairStyle: 'short', sleeves: 'short', shorts: false,
+    expression: 'neutral', headW: 1, beard: 0, stache: 0, stubble: 0, blink: true, eyeSize: 1, eyeGap: 1, eyeY: 0, browThick: 1, mouthSize: 1, mouthY: 0, noseSize: 1
+  },
+  expressions: {   // eyeH = how open / browTilt: + angry (inner ends down), - sad / browRaise / mouthCurve: + smile, - frown / mouthOpen / lookX, lookY = where the pupils look
+    neutral:   { eyeH: 1,    browTilt: 0,    browRaise: 0,    mouthCurve: 0,    mouthOpen: 0,    mouthW: 0.8, lookX: 0, lookY: 0 },
+    happy:     { eyeH: 0.78, browTilt: -0.15, browRaise: 0.35, mouthCurve: 1,    mouthOpen: 0.35, mouthW: 1.15, lookX: 0, lookY: 0 },
+    angry:     { eyeH: 0.72, browTilt: 1,    browRaise: -0.35, mouthCurve: -0.8, mouthOpen: 0,    mouthW: 0.85, lookX: 0, lookY: 0 },
+    sad:       { eyeH: 0.8,  browTilt: -1,   browRaise: 0.15, mouthCurve: -1,   mouthOpen: 0,    mouthW: 0.6, lookX: 0, lookY: -0.5 },
+    surprised: { eyeH: 1.4,  browTilt: 0,    browRaise: 1,    mouthCurve: 0,    mouthOpen: 1,    mouthW: 0.5, lookX: 0, lookY: 0 },
+    smirk:     { eyeH: 0.85, browTilt: 0.4,  browRaise: 0.15, mouthCurve: 0.55, mouthOpen: 0,    mouthW: 0.9, lookX: 0.4, lookY: 0 }
+  },
+  clips: HumanMotion.clips,
+  // ---- tiny vector helpers ----
+  add: (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]], sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]], mul: (a, k) => [a[0] * k, a[1] * k, a[2] * k],
+  dot: (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2], cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]],
+  nrm(a){ const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; },
+  lerp: (a, b, k) => [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k],
+  col(h){ const cc = this._cc || (this._cc = new Map()); let r = cc.get(h); if (r === undefined){ const n = parseInt(String(h).replace('#', ''), 16) || 0; r = [n >> 16 & 255, n >> 8 & 255, n & 255]; cc.set(h, r); } return r.slice(); },   // parsed once, a copy is returned (callers may change it)
+  ik(S, T, l1, l2, pole){   // 2 bones in 3D: shoulder / hip S to hand / ankle T. Returns the elbow / knee (bent towards `pole`) and the hand / ankle (pulled in if out of reach)
+    let d = this.sub(T, S), L = Math.hypot(d[0], d[1], d[2]); const mx = l1 + l2 - 0.05; if (L > mx){ d = this.mul(d, mx / L); L = mx; } if (L < 1) L = 1;
+    const n = this.mul(d, 1 / L), a = (l1 * l1 - l2 * l2 + L * L) / (2 * L), h = Math.sqrt(Math.max(0, l1 * l1 - a * a));
+    let pv = this.sub(pole, this.mul(n, this.dot(pole, n))); pv = this.nrm(pv);
+    return { e: this.add(this.add(S, this.mul(n, a)), this.mul(pv, h)), h: this.add(S, d) };
+  },
+  foot(ph, s, lift){ ph -= Math.floor(ph); if (ph < 0.6) return [s * (0.5 - ph / 0.6), 0]; const v = (ph - 0.6) / 0.4; return [s * (-0.5 + v), lift * Math.sin(Math.PI * v)]; },   // [forward offset, height]
+  draw(g, ch, s){
+    const M = this, lod = CONFIG.zoom * this.size * ((ch.rig && ch.rig.height) || 1) < this.lodAt, p = Object.assign({}, this.defaults, ch.rig || {}), cl0 = HumanMotion.get(ch.clip), t = ch.t || 0, sT = CONFIG.tilt, cT = Math.sqrt(1 - sT * sT), TAU = Math.PI * 2;   // lod: the character is only a few pixels tall -> skip face, ears, nose, outlines (invisible at that size)
+    const f = ch.face || 1, dir = ch.dir || 'front';
+    const ta = dir === 'side' ? f * Math.PI / 2 : dir === 'back' ? Math.PI : dir === 'fdiag' ? f * Math.PI / 4 : dir === 'bdiag' ? Math.PI - f * Math.PI / 4 : 0;
+    const now = performance.now(), dt = Math.min(0.05, (now - (ch._yt || now)) / 1000); ch._yt = now;   // he turns round smoothly
+    if (ch._ya === undefined) ch._ya = ta; ch._ya += Math.atan2(Math.sin(ta - ch._ya), Math.cos(ta - ch._ya)) * (ch.yawLock ? 0 : Math.min(1, dt * 11));
+    const bowP = ch.bowl ? BowlingMotion.pose(ch) : null;   // BOWLING hook 1: a bowler's delivery takes over the pose
+    const batOn = BatFactory.has(ch), alr = batOn ? (ch.alert || 0) : 0, trg = batOn ? (ch.trigP || 0) : 0, bw = batOn ? BatFactory.blend(ch, dt) : 0, _bal = (BatFactory._al = alr), shotP = batOn && ch.shot ? ShotFactory.pose(ch, dt) : null, fp = ch.pk ? FielderMotion.pose(ch) : null, cl1 = bw > 0.001 ? BatFactory.clip(cl0, bw, alr, trg) : cl0, cl = fp ? FielderMotion.clip(cl1, fp) : shotP ? ShotFactory.clip(cl1, shotP) : (bowP && bowP.own ? BowlingMotion.clip(cl1, bowP) : cl1), BZ = shotP ? shotP.bz : 0;   // SHOT hook: a running shot takes over the pose   // BAT hook 1: holding the bat adds a batting stance to the idle clip
+    const ya = ch._ya, ca = Math.cos(ya), sa = Math.sin(ya);
+    // ---- face state: expression blends smoothly, blinking ----
+    const tgt = Object.assign({}, this.expressions.neutral, this.expressions[p.expression] || {}), ex = ch._ex || (ch._ex = Object.assign({}, tgt));
+    if (!lod) for (const k in tgt) ex[k] += (tgt[k] - ex[k]) * Math.min(1, dt * 10);
+    if (ch._nb === undefined) ch._nb = now + 1500; if (now > ch._nb){ ch._bs = now; ch._nb = now + 2200 + Math.random() * 2800; }
+    const blink = p.blink && ch._bs && now - ch._bs < 150 ? Math.sin(Math.PI * (now - ch._bs) / 150) : 0;
+    const C = { skin: M.col(p.skin), shirt: M.col(p.shirt), pants: M.col(p.pants), shoes: M.col(p.shoes), hair: M.col(p.hair), eye: M.col(p.eyeColor), white: [246, 246, 244], lip: M.mul(M.col(p.skin), 0.62), mouth: [58, 18, 22], belt: [26, 24, 28] };
+    // ---- body measurements (all from the params) ----
+    const th = p.limbThick, fat = p.belly, legB = 12.5 * p.legLen, armB = 10.5 * p.armLen;
+    const cyc = t * cl.cps, TW = Math.PI * 2, bnc = HumanMotion.bounce(cl, cyc, t), px = -Math.sin(cyc * TW) * cl.sway;   // px = hips shift over the standing foot
+    const tws = fp && fp.tw !== undefined ? fp.w * fp.tw : shotP && shotP.tw !== undefined ? shotP.tw : cl.twist ? -Math.cos(cyc * TW) * cl.twist : 0, hipYaw = fp && fp.hp !== undefined ? fp.w * fp.hp : shotP && shotP.hp !== undefined ? shotP.hp : -tws * 0.5,   /* SHOT FLOW hook 3: the shot sets shoulder + hip yaw separately */ twC = Math.cos(tws), twS = Math.sin(tws), hpC = Math.cos(hipYaw), hpS = Math.sin(hipYaw);   // shoulders turn one way, hips the other
+    const lean = cl.lean, cl_ = Math.cos(lean), sl_ = Math.sin(lean);
+    const Lleg = 2 * legB * 0.99, half = cl.stride / 2;
+    const hy = 3.6 + Math.sqrt(Math.max(1, Lleg * Lleg - half * half)) + 1.2 - (cl.crouch || 0) + bnc * 0.5 + (bowP && bowP.own ? bowP.lift : 0), sy = hy + 17.5 * p.torsoLen + bnc * 0.2;   // hip height: legs are straightest when the foot lands (the hips drop with a long stride) / shoulder height
+    const tw = 5 * p.bodyW * (1 + fat * 0.22), td = 3.3 * p.bodyD * (1 + fat * 0.45), chW = 6.2 * p.shoulderW * (1 + fat * 0.1), shJ = chW + 1.6 * th, hipX = 3.7 * p.hipW;
+    const rotP = (q) => { const dy = q[1] - hy, k = dy / 40, x = q[0] + px * 0.3 * k, y = hy + dy * cl_ - q[2] * sl_, z = q[2] * cl_ + dy * sl_; return [x * twC + z * twS, y, -x * twS + z * twC]; };   // the upper body leans forward round the hips, then turns
+    const rotV = (v) => { const y = v[1] * cl_ - v[2] * sl_, z = v[2] * cl_ + v[1] * sl_; return [v[0] * twC + z * twS, y, -v[0] * twS + z * twC]; };
+    const P = (q) => { const X = q[0] * ca + (q[2] + BZ) * sa, Z = -q[0] * sa + (q[2] + BZ) * ca; return { x: X, y: Z * sT - q[1] * cT, d: Z * cT + q[1] * sT }; };   // 3D point -> screen offset + depth
+    const items = [], add = (d, fn) => items.push({ d, fn });
+    const LV = M.nrm([-0.45, 0.8, 0.5]);
+    const shade = (n) => { const nX = n[0] * ca + n[2] * sa, nZ = -n[0] * sa + n[2] * ca; if (n[1] * sT + nZ * cT <= 0.002) return -1; return 0.68 + 0.32 * Math.max(0, nX * LV[0] + n[1] * LV[1] + nZ * LV[2]); };
+    const RC = M._rc || (M._rc = new Map()), rgb = (c, b) => { const bq = Math.min(299, b * 100 | 0), k = (((c[0] | 0) * 256 + (c[1] | 0)) * 256 + (c[2] | 0)) * 300 + bq; let r = RC.get(k); if (r === undefined){ const f = bq / 100; r = 'rgb(' + (Math.min(255, c[0] * f) | 0) + ',' + (Math.min(255, c[1] * f) | 0) + ',' + (Math.min(255, c[2] * f) | 0) + ')'; RC.set(k, r); } return r; };   // colour strings are cached (no string building per face)
+    const poly = (pts, col, b) => { g.beginPath(); for (let i = 0; i < pts.length; i++){ const q = P(pts[i]); if (i) g.lineTo(q.x, q.y); else g.moveTo(q.x, q.y); } g.closePath(); g.fillStyle = rgb(col, b); g.fill(); if (!lod){ g.lineJoin = 'round'; g.strokeStyle = 'rgba(8,9,12,.55)'; g.lineWidth = 0.5; g.stroke(); } };
+    const AX = [1, 0, 0], AY = [0, 1, 0], AZ = [0, 0, 1], UVQ = [-1, -1, 1, -1, 1, 1, -1, 1];
+    const box = (c, h, col, o) => {   // c = centre, h = half sizes, o: { u: leans with the upper body, bias: depth nudge }
+      o = o || {}; let ax = AX, ay = AY, az = AZ; if (o.u){ const hd = o.u === 'h'; c = (hd ? rotHP : rotP)(c); ax = (hd ? rotHV : rotV)(ax); ay = (hd ? rotHV : rotV)(ay); az = (hd ? rotHV : rotV)(az); } if (o.ax){ ax = o.ax; ay = o.ay; az = o.az; }
+      add(P(c).d + (o.bias || 0), () => {
+        const A = [ax, ay, az];
+        for (let k = 0; k < 3; k++) for (let si = 0; si < 2; si++){   // the (up to) 3 faces that point at the camera, drawn straight to the canvas with no temporary arrays
+          const sg = si ? 1 : -1, Ak = A[k], nx = Ak[0] * sg, ny = Ak[1] * sg, nz = Ak[2] * sg, nX = nx * ca + nz * sa, nZ = -nx * sa + nz * ca;
+          if (ny * sT + nZ * cT <= 0.002) continue;
+          const b = 0.68 + 0.32 * Math.max(0, nX * LV[0] + ny * LV[1] + nZ * LV[2]), i = (k + 1) % 3, j = (k + 2) % 3, Ai = A[i], Aj = A[j], hk = sg * h[k], hi = h[i], hj = h[j];
+          g.beginPath();
+          for (let q = 0; q < 8; q += 2){ const u = UVQ[q] * hi, v = UVQ[q + 1] * hj, x0 = c[0] + Ak[0] * hk + Ai[0] * u + Aj[0] * v, y0 = c[1] + Ak[1] * hk + Ai[1] * u + Aj[1] * v, z0 = c[2] + Ak[2] * hk + Ai[2] * u + Aj[2] * v + BZ, X = x0 * ca + z0 * sa, Z = -x0 * sa + z0 * ca, Y = Z * sT - y0 * cT; if (q) g.lineTo(X, Y); else g.moveTo(X, Y); }
+          g.closePath(); g.fillStyle = rgb(col, b); g.fill(); if (!lod){ g.lineJoin = 'round'; g.strokeStyle = 'rgba(8,9,12,.55)'; g.lineWidth = 0.5; g.stroke(); }
+        }
+      });
+    };
+    const seg = (a, b, hx, hz, col, o) => {   // a box stretched from point a to point b (half thickness hx / hz)
+      o = Object.assign({}, o || {}); if (o.u){ const rp = o.u === 'h' ? rotHP : rotP; a = rp(a); b = rp(b); o.u = false; }
+      const ay = M.nrm(M.sub(b, a)), hint = Math.abs(ay[2]) > 0.9 ? AX : AZ, ax = M.nrm(M.cross(ay, hint)), az = M.cross(ax, ay);
+      o.ax = ax; o.ay = ay; o.az = az; box(M.mul(M.add(a, b), 0.5), [hx, Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]) / 2, hz], col, o);
+    };
+    if (!ch.ghost){ const Z = this.size * p.height; g.fillStyle = 'rgba(0,0,0,.34)'; const o0 = P([0, 0, 0]); g.beginPath(); g.ellipse(s.x + o0.x * Z, s.y + o0.y * Z, 17 * Z * (0.8 + 0.2 * p.bodyW), 17 * Z * sT * 0.95 * (0.8 + 0.2 * p.bodyW), 0, 0, 7); g.fill(); }
+    g.save(); g.translate(s.x, s.y); g.scale(this.size * p.height, this.size * p.height);
+    const gait = (sd) => HumanMotion.foot(cyc + (sd > 0 ? 0.5 : 0), cl.stride, cl.lift, cl.duty), ftL0 = shotP ? shotP.fb : fp ? [fp.fb * fp.w, (fp.fl || 0) * fp.w] : bowP && bowP.own ? bowP.f[0] : gait(-1), ftR0 = shotP ? shotP.ff : fp ? [fp.ff * fp.w, 0] : bowP && bowP.own ? bowP.f[1] : gait(1), sp_ = BatFactory.spec.stanceSpread * bw * (1 - (BatFactory._r2 || 0)), ftL = [ftL0[0] - sp_, ftL0[1]], ftR = [ftR0[0] + sp_, ftR0[1]];   // BAT STANCE: feet planted apart along the pitch (back foot behind, front foot ahead), in every shot too   // SHOT: back foot / front foot are planned by the shot
+    // ---- pelvis, belt, belly, torso ----
+    box([px, hy + 1, 0], [hipX + 2.5, 3.2, td * 1.05 + 0.4], C.pants, { ax: [hpC, 0, -hpS], ay: AY, az: [hpS, 0, hpC] });   // pelvis (turns against the shoulders)
+    box([px, hy + 4.2, 0], [hipX + 2.6, 0.8, td * 1.08 + 0.5], C.belt, { u: true });
+    seg([px, hy + 3, 0], [0, hy + (sy - hy) * 0.55, 0], tw * 0.92, td * 0.95, C.shirt, { u: true });   // waist
+    box([0, sy - 4.6, 0], [chW, 5.4, td * 1.06], C.shirt, { u: true, bias: 0.2 });   // chest
+    if (fat > 0.04) box([0, hy + 6.5, td * 0.4 + fat * 1.3], [tw * 0.98 + fat * 1.8, 4.8 + fat * 0.9, td * 0.7 + fat * 2.4], C.shirt, { u: true, bias: 0.5 });   // belly
+    const KQ = p.kit && JerseyFactory.on ? { M, g, P, rotP, rotV, shade, add, box, seg, hy, sy, tw, td, chW, th, px, lod, p } : null; if (KQ) JerseyFactory.torso(KQ);   // v84: a team kit (collar, side panels, print)
+    // ---- neck + head ----
+    const nkH = 2.1 * p.neckLen, hh = 4.3 * p.headSize, hxh = 3.5 * p.headSize * p.headW, hzh = 3.8 * p.headSize, hcy = sy + 1 + nkH * 2 + hh - 0.6, hz0 = 0.4, zf = hz0 + hzh + 0.03;
+    const hA = -lean * (cl.headKeep || 0) + (ch.gzP || 0), hcs = Math.cos(hA), hsn = Math.sin(hA), yH = Math.max(-1.3, Math.min(1.3, -tws * (shotP && shotP.tw !== undefined ? ShotFlowFactory.cfg.headFollow : 0.75) + (ch.gzY || 0))), yC = Math.cos(yH), yS = Math.sin(yH), pn = rotP([0, sy + 1 + nkH * 2, 0]);   // the head stays more upright than the leaning body and keeps looking ahead while the shoulders turn
+    const hrot = (d) => { const a1 = [d[0], d[1] * hcs - d[2] * hsn, d[2] * hcs + d[1] * hsn]; return [a1[0] * yC + a1[2] * yS, a1[1], -a1[0] * yS + a1[2] * yC]; };
+    const rotHP = (q) => M.add(pn, hrot(M.sub(rotP(q), pn))), rotHV = (v) => hrot(rotV(v));
+    box([0, sy + 1 + nkH, 0.2], [1.9, nkH + 0.7, 1.9], C.skin, { u: true });
+    box([0, hcy, hz0], [hxh, hh, hzh], C.skin, { u: 'h', bias: 0.4 });   // head
+    if (!lod) for (const sd of [-1, 1]) box([sd * (hxh + 0.4), hcy - 0.4, hz0 - 0.3], [0.55, 1.5 * p.headSize, 1.1 * p.headSize], C.skin, { u: 'h', bias: 0.45 });   // ears
+    { const ns = p.noseSize; if (!lod && ns > 0.05) box([0, hcy - hh * 0.2, zf + 0.5 * ns], [0.7 * ns, 1.1 * ns, 0.6 * ns], C.skin, { u: 'h', bias: 0.8 }); }   // nose
+    // ---- HAIR ----
+    if (p.hairStyle !== 'bald'){
+      const rc = p.hairStyle === 'receding';   // receding hairline: no fringe, the top hair only covers the back of the head
+      box([0, hcy + hh * 0.86, hz0 - (rc ? hzh * 0.12 : 0)], [hxh * 1.07, hh * 0.2, hzh * (rc ? 0.92 : 1.07)], C.hair, { u: 'h', bias: 0.9 });   // top
+      if (!lod && rc) box([0, hcy + hh * 0.74, hz0 + hzh * 0.94], [hxh * 0.5, hh * 0.1, hzh * 0.2], C.hair, { u: 'h', bias: 0.96 });   // thin widow's-peak fringe
+      if (!lod && !rc) box([0, hcy + hh * 0.7, hz0 + hzh * 0.92], [hxh * 1.03, hh * 0.14, hzh * 0.2], C.hair, { u: 'h', bias: 0.95 });   // fringe
+      box([0, hcy + hh * 0.1, hz0 - hzh * 0.82], [hxh * 1.06, hh * 0.9, hzh * 0.26], C.hair, { u: 'h', bias: 0.3 });   // back of the head
+      if (!lod) for (const sd of [-1, 1]) box([sd * hxh * 1.04, hcy + hh * 0.5, hz0 - hzh * 0.1], [hxh * 0.06, hh * 0.5, hzh * 0.85], C.hair, { u: 'h', bias: 0.6 });   // sides
+      if (p.hairStyle === 'spiky') for (let i = -2; i <= 2; i++) seg([i * hxh * 0.4, hcy + hh * 1.0, hz0 + (Math.abs(i) - 1) * 0.3], [i * hxh * 0.55, hcy + hh * (1.7 - Math.abs(i) * 0.17), hz0 - 0.4 - Math.abs(i) * 0.3], hxh * 0.2, hxh * 0.2, C.hair, { u: 'h', bias: 0.95 });
+      if (p.hairStyle === 'starc') for (let i = -2; i <= 2; i++){   // STARC: short dark textured top, pushed up and a little forward, short tidy sides
+        const a = Math.abs(i); seg([i * hxh * 0.4, hcy + hh * 0.98, hz0 + 0.3 - a * 0.25], [i * hxh * 0.48 + 0.3, hcy + hh * (1.2 - a * 0.04), hz0 + 0.7 - a * 0.3], hxh * 0.3, hxh * 0.3, C.hair, { u: 'h', bias: 0.95 }); }
+      if (p.hairStyle === 'smith'){   // SMITH: thick, messy, longer brown hair - big tousled top, heavy fringe, sideburns over the ears, hair down the neck
+        box([0, hcy + hh * 1.0, hz0], [hxh * 1.12, hh * 0.26, hzh * 1.12], C.hair, { u: 'h', bias: 0.92 });
+        for (let i = -2; i <= 2; i++){ const a = Math.abs(i), up = 1.28 + 0.1 * ((i * 5 + 9) % 3), zz = ((i + 3) % 2 ? 0.7 : -0.5); seg([i * hxh * 0.4, hcy + hh * 1.0, hz0 + zz * 0.3], [i * hxh * 0.5 + (i % 2 ? 0.4 : -0.3), hcy + hh * (up - a * 0.05), hz0 + zz], hxh * 0.34, hxh * 0.34, C.hair, { u: 'h', bias: 0.95 }); }
+        if (!lod){ box([0, hcy + hh * 0.62, hz0 + hzh * 0.94], [hxh * 1.06, hh * 0.22, hzh * 0.2], C.hair, { u: 'h', bias: 0.96 }); for (const sd of [-1, 1]) box([sd * hxh * 1.04, hcy + hh * 0.1, hz0 - hzh * 0.05], [hxh * 0.08, hh * 0.62, hzh * 0.78], C.hair, { u: 'h', bias: 0.62 }); }
+        box([0, hcy - hh * 0.4, hz0 - hzh * 0.9], [hxh * 1.05, hh * 0.75, hzh * 0.3], C.hair, { u: 'h', bias: 0.28 }); }
+      if (p.hairStyle === 'kohli'){   // KOHLI / KULDEEP: thick styled top with a lifted quiff, short faded sides
+        box([0, hcy + hh * 1.05, hz0 + hzh * 0.05], [hxh * 1.06, hh * 0.3, hzh * 1.04], C.hair, { u: 'h', bias: 0.93 });
+        box([0, hcy + hh * 1.3, hz0 + hzh * 0.5], [hxh * 0.88, hh * 0.24, hzh * 0.5], C.hair, { u: 'h', bias: 0.95 });
+        if (!lod) box([-hxh * 0.25, hcy + hh * 0.74, hz0 + hzh * 0.94], [hxh * 0.8, hh * 0.15, hzh * 0.2], C.hair, { u: 'h', bias: 0.96 }); }
+      if (p.hairStyle === 'long') box([0, hcy - hh * 0.55, hz0 - hzh * 0.9], [hxh * 1.1, hh * 1.65, hzh * 0.3], C.hair, { u: 'h', bias: 0.25 });
+    }
+    if (!lod && p.beard > 0.05){   // BEARD: chin + jaw (dense), over the stubble shadow
+      box([0, hcy - hh * 0.84, hz0 + hzh * 0.88], [hxh * 0.97, hh * (0.14 + 0.1 * p.beard), hzh * 0.2], C.hair, { u: 'h', bias: 0.9 });
+      for (const sd of [-1, 1]) box([sd * hxh * 1.0, hcy - hh * 0.6, hz0 + hzh * 0.1], [hxh * 0.06, hh * 0.42, hzh * 0.85], C.hair, { u: 'h', bias: 0.62 }); }
+    // ---- FACE: flat features drawn on the head's front (and, seen from the side, on its side). They are lit + face-culled like the boxes ----
+    const eyeOpen = Math.max(0.04, ex.eyeH * (1 - blink * 0.94)), ew = hxh * 0.25 * p.eyeSize, eh = hh * 0.2 * p.eyeSize * eyeOpen, exx = hxh * 0.46 * p.eyeGap, eyy = hcy + hh * 0.1 + p.eyeY * hh * 0.1;
+    const brY = eyy + hh * 0.21 * p.eyeSize + ex.browRaise * hh * 0.11 + 0.4, brT = hh * 0.055 * p.browThick, brL = ew * 1.3, brTilt = ex.browTilt * hh * 0.11;
+    const mW = hxh * 0.6 * ex.mouthW * p.mouthSize, mY = hcy - hh * 0.52 + p.mouthY * hh * 0.1, mC = ex.mouthCurve * hh * 0.17, mO = ex.mouthOpen * hh * 0.3, mT = hh * 0.055;
+    const frontA = Math.max(0, Math.min(1, (Math.abs(ca) - 0.15) / 0.35)), sideA = Math.max(0, Math.min(1, (0.62 - Math.abs(ca)) / 0.3));   // front features fade as he turns side-on, side features fade in
+    const fq = (pts, col, nrm, bias, alpha) => {
+      const n = rotHV(nrm), b = shade(n); if (b < 0 || alpha <= 0.02) return;
+      const q = pts.map(rotHP), c = [0, 0, 0]; for (const v of q){ c[0] += v[0] / q.length; c[1] += v[1] / q.length; c[2] += v[2] / q.length; }
+      add(P(c).d + bias, () => { g.globalAlpha = alpha; g.beginPath(); q.forEach((v, i) => { const o = P(v); i ? g.lineTo(o.x, o.y) : g.moveTo(o.x, o.y); }); g.closePath(); g.fillStyle = rgb(col, Math.min(1, b)); g.fill(); g.globalAlpha = 1; });
+    };
+    const curve = (u0, u1, n, fn) => { const o = []; for (let i = 0; i <= n; i++) o.push(u0 + (u1 - u0) * i / n); return o.map(fn); };
+    if (!lod && frontA > 0){   // front plane: a = across, b = up
+      const F = (a, b) => [a, b, zf];
+      for (const sd of [-1, 1]){
+        const cx = sd * exx, pw = ew * 0.52, ph = Math.min(eh, ew * 0.62), px2 = cx + ex.lookX * (ew - pw) * 0.8, py = eyy + ex.lookY * Math.max(0, eh - ph) * 0.8;
+        fq([F(cx - ew, eyy - eh), F(cx + ew, eyy - eh), F(cx + ew, eyy + eh), F(cx - ew, eyy + eh)], C.white, AZ, 1.1, frontA);
+        fq([F(px2 - pw, py - ph), F(px2 + pw, py - ph), F(px2 + pw, py + ph), F(px2 - pw, py + ph)], C.eye, AZ, 1.2, frontA);
+        const ix = cx - sd * brL, ox = cx + sd * brL, iy = brY - brTilt, oy = brY + brTilt;   // brow: inner end (towards the nose) and outer end
+        fq([F(ix, iy - brT), F(ox, oy - brT), F(ox, oy + brT), F(ix, iy + brT)], C.hair, AZ, 1.3, frontA);
+      }
+      if (p.stache > 0.02) fq([F(-hxh * 0.55, hcy - hh * 0.34), F(hxh * 0.55, hcy - hh * 0.34), F(hxh * 0.5, hcy - hh * 0.47), F(-hxh * 0.5, hcy - hh * 0.47)], C.hair, AZ, 1.07, frontA * Math.min(1, p.stache));   // moustache
+      if (p.stubble > 0.02) fq([F(-hxh * 0.95, hcy - hh * 0.3), F(hxh * 0.95, hcy - hh * 0.3), F(hxh * 0.9, hcy - hh * 0.98), F(-hxh * 0.9, hcy - hh * 0.98)], M.mul(C.skin, 0.74), AZ, 1.05, frontA * p.stubble);   // stubble: a darker jaw shadow
+      const top = curve(-1, 1, 6, u => F(u * mW, mY + mC * u * u)), bot = curve(1, -1, 6, u => F(u * mW, mY + mC * u * u - mT - mO * (1 - u * u)));
+      fq(top.concat(bot), mO > 0.4 ? C.mouth : C.lip, AZ, 1.1, frontA);
+    }
+    if (!lod && sideA > 0) for (const sd of [-1, 1]){   // side plane: a = depth (front is +), b = up
+      const x0 = sd * (hxh + 0.04), S2 = (a, b) => [x0, b, a], zc = hz0 + hzh * 0.56, sw = hzh * 0.2 * p.eyeSize, pw = sw * 0.5, ph = Math.min(eh, sw * 0.6);
+      fq([S2(zc - sw, eyy - eh), S2(zc + sw, eyy - eh), S2(zc + sw, eyy + eh), S2(zc - sw, eyy + eh)], C.white, [sd, 0, 0], 1.1, sideA);
+      const pz = zc + sw - pw + ex.lookX * 0, py = eyy + ex.lookY * Math.max(0, eh - ph) * 0.8;
+      fq([S2(pz - pw, py - ph), S2(pz + pw, py - ph), S2(pz + pw, py + ph), S2(pz - pw, py + ph)], C.eye, [sd, 0, 0], 1.2, sideA);
+      const iz = zc + sw * 1.2, oz = zc - sw * 1.2, iy = brY - brTilt, oy = brY + brTilt;
+      fq([S2(iz, iy - brT), S2(oz, oy - brT), S2(oz, oy + brT), S2(iz, iy + brT)], C.hair, [sd, 0, 0], 1.3, sideA);
+      if (p.stubble > 0.02) fq([S2(hz0 - hzh * 0.2, hcy - hh * 0.3), S2(hz0 + hzh * 0.98, hcy - hh * 0.3), S2(hz0 + hzh * 0.98, hcy - hh * 0.98), S2(hz0 - hzh * 0.2, hcy - hh * 0.98)], M.mul(C.skin, 0.74), [sd, 0, 0], 1.05, sideA * p.stubble);
+      const mz0 = hz0 + hzh * 0.98, mw2 = mW * 0.8, top = curve(0, 1, 5, u => S2(mz0 - u * mw2, mY + mC * u * u)), bot = curve(1, 0, 5, u => S2(mz0 - u * mw2, mY + mC * u * u - mT - mO * (1 - u)));
+      fq(top.concat(bot), mO > 0.4 ? C.mouth : C.lip, [sd, 0, 0], 1.1, sideA);
+    }
+    // ---- shoulders + arms: shoulder -> elbow -> hand with IK, hands swing opposite to the legs ----
+    const batS = batOn ? BatFactory.begin(M, bw, t, M.lerp(rotP([-shJ, sy - 1.2, 0]), rotP([shJ, sy - 1.2, 0]), 0.5), rotV, shotP) : null;   // BAT hook 2
+    for (const sd of [-1, 1]){
+      const S0 = rotP([sd * shJ, sy - 1.2, 0]), run = cl.run ? 1 : 0, bend = cl.armBend, ang = HumanMotion.armAngle(cl, cyc, sd) + lean * 0.75;   // arm swing angle (+ = forward), measured from straight down
+      const R = armB * 2 * (0.95 - 0.33 * bend), up = Math.max(0, Math.sin(ang)) * armB * 0.55 * bend;   // reach: elbows bend more the harder he runs, and the hand rises on the forward swing
+      let T = [S0[0] + sd * (0.9 - run * 1.8), S0[1] - Math.cos(ang) * R + up, S0[2] + Math.sin(ang) * R + 0.8];
+      if (fp) T = FielderMotion.hand(fp, sd, T);   // FIELDING hook: hands go to the ball
+      if (batS) T = BatFactory.hand(batS, sd, T, ang);
+      if (bowP && bowP.own) T = BowlingMotion.hand(bowP, sd, S0, armB);   // BOWLING hook 2: arms follow the delivery   // BAT hook 3: the hands go to the handle
+      const pole = [sd * (0.22 - 0.12 * bend), -0.35 - 0.45 * bend, -0.75 + 0.25 * bend]; if (batS && batS.w > 0.01){ const q = [sd * 0.75, batS.elb, -0.15]; const bwp = batS.w * (batS.one && sd > 0 ? 0 : 1); for (let i = 0; i < 3; i++) pole[i] += (q[i] - pole[i]) * bwp; }   // elbows go out and down in the stance
+      if (fp && fp.pole){ const q = sd > 0 ? fp.pole.R : fp.pole.L; for (let i = 0; i < 3; i++) pole[i] += (q[i] - pole[i]) * fp.w; }   // throw: elbow directions per arm
+      else if (fp){ pole[0] += (sd * 0.6 - pole[0]) * fp.w; pole[1] += (0.1 - pole[1]) * fp.w; pole[2] += (-0.5 - pole[2]) * fp.w; }
+      const ar = M.ik(S0, T, armB, armB, pole), E = ar.e, Hd = ar.h, sleeveCol = p.sleeves === 'none' ? C.skin : C.shirt, foreCol = p.sleeves === 'long' ? C.shirt : C.skin;
+      if (batS) BatFactory.got(batS, sd, Hd, ang);
+      box(M.add(S0, [sd * 0.3, 0, 0]), [2.7 * th, 2.5 * th, 2.8 * th * (0.8 + 0.2 * p.bodyD)], sleeveCol, { bias: 0.1 });   // shoulder cap
+      seg(S0, E, 2.5 * th, 2.5 * th, p.sleeves === 'none' ? C.skin : sleeveCol, { bias: -0.1 });   // upper arm
+      seg(E, Hd, 2.2 * th, 2.2 * th, foreCol, { bias: 0.3 });   // forearm
+      if (KQ) JerseyFactory.sleeve(KQ, sd, S0, E);   // kit: sleeve cuff
+      box(Hd, [1.9 * th * p.handSize, 2.4 * th * p.handSize, 1.9 * th * p.handSize], C.skin, { bias: 1.6 });   // hand
+      if (ch.bowl && ch.bowl.held && sd === ch.bowl.bs){ const dv = M.nrm(M.sub(Hd, E)), Cb = M.add(Hd, M.mul(dv, 2.6)), Zs = this.size * p.height, Xb = Cb[0] * ca + (Cb[2] + BZ) * sa, Zb = -Cb[0] * sa + (Cb[2] + BZ) * ca; ch._hw = { x: ch.x + Xb * Zs, y: ch.y + Zb * Zs, z: Cb[1] * Zs }; add(P(Cb).d + 1.9, () => { const q = P(Cb); BallFactory.sphere(g, q.x, q.y, BallFactory.R / Zs, ch.ball && ch.ball.m); }); }   // BOWLING hook 3: the ball in the bowling hand (+ where it is in the world, for the release)
+    }
+    // ---- legs: hip -> knee -> ankle ----
+    for (const sd of [-1, 1]){
+      const ft = sd < 0 ? ftL : ftR, hip = [px + sd * hipX * hpC, hy - 0.5, -sd * hipX * hpS], ank = [sd * (hipX + 1.2), 3 + ft[1], ft[0]];
+      const lg = M.ik(hip, ank, legB, legB, [0, 0.1, 1]), K = lg.e, A = lg.h, lowCol = p.shorts ? C.skin : C.pants;
+      seg(hip, K, 3.1 * th, 3.2 * th, C.pants, {});   // thigh
+      if (KQ) JerseyFactory.leg(KQ, sd, hip, K);   // kit: trouser stripe
+      seg(K, A, 2.6 * th, 2.8 * th, lowCol, { bias: 0.2 });   // shin
+      { const hl = shotP && sd < 0 ? ft[1] : 0, fs = 4.8 * p.footSize;   // shoe (the back foot rolls onto its toes in a shot)
+        if (hl > 0.05){ const sn = Math.min(0.9, hl / (2 * fs)), cs = Math.sqrt(1 - sn * sn); box(M.add(A, [0, -1.0 - hl / 2, 2.2 * p.footSize]), [2.7 * th, 2.1, fs], C.shoes, { bias: 0.3, ax: AX, ay: [0, cs, sn], az: [0, -sn, cs] }); }
+        else box(M.add(A, [0, -1.0, 2.2 * p.footSize]), [2.7 * th, 2.1, fs], C.shoes, { bias: 0.3 }); }
+    }
+    if (batS) BatFactory.render({ M, add, P, shade, poly }, batS);   // BAT hook 4: draw the bat
+    items.sort((a, b) => a.d - b.d); for (const it of items) it.fn();
+    g.restore();
+  }
+};
+
+BatFactory.M = HumanRigFactory;
+
+/* ============ JERSEY FACTORY (v84: team kits for the 3D rig)
+   A kit = colours + print. JerseyFactory.dress(ch, 'australia') sets the man's shirt / trousers / shoes and marks him with ch.rig.kit = { id, name, no }; the rig then calls torso / sleeve / leg while it builds him.
+   AUSTRALIA: gold shirt with a green collar ring + V-neck, green side panels, green sleeve cuffs, a small crest on the chest, AUSTRALIA printed across the chest, the player's NAME and NUMBER on the back, green trousers with a gold side stripe, white shoes.
+   Prints are drawn flat on the chest plane (they turn and tilt with the body, and only show when that side faces the camera). Add a kit = one entry in `kits` (+ nothing else). TUNE: kits. JerseyFactory.on = false hides every kit detail (plain colours stay). ============ */
+const JerseyFactory = {
+  on: true,
+  kits: {
+    india: { shirt: '#1f5fd1', pants: '#0d2b6b', shoes: '#f2f2ee', gold: '#ffffff', green: '#ff8a1f', dark: '#ffffff', white: '#ffffff', pin: 'rgba(255,255,255,.13)', front: 'INDIA' },
+    australia: { shirt: '#ffcd00', pants: '#0a5c36', shoes: '#f2f2ee', gold: '#ffcd00', green: '#00843d', dark: '#00573a', white: '#f6f3e8', pin: 'rgba(190,140,0,.35)', front: 'AUSTRALIA' }
+  },
+  col(h){ return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)]; },
+  hash(s){ let h = 7; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) | 0; return Math.abs(h); },
+  dress(ch, id, o){
+    const K = this.kits[id]; if (!K) return ch; o = o || {};
+    const nm = String(o.name || (ch.player && ch.player.name) || ch.homeName || 'PLAYER').toUpperCase(), no = o.no || (this.hash(nm) % 98) + 1;
+    ch.rig = Object.assign(ch.rig || {}, { shirt: K.shirt, pants: K.pants, shoes: K.shoes, sleeves: 'short', kit: { id, name: nm, no } }); return ch;
+  },
+  tex(Q, face, y, fn){   // draw flat on the chest front (face = 1) or back (face = -1) plane; local x = reading direction, local y = down, 1 unit = 1 rig unit, origin = (centre, y)
+    const z = face * (Q.td * 1.06 + 0.06); if (Q.shade(Q.rotV([0, 0, face])) < 0) return;
+    const o = Q.P(Q.rotP([0, y, z])), ux = Q.P(Q.rotP([face, y, z])), uy = Q.P(Q.rotP([0, y - 1, z]));
+    Q.add(o.d + 1.0, () => { const g = Q.g; g.save(); g.transform(ux.x - o.x, ux.y - o.y, uy.x - o.x, uy.y - o.y, o.x, o.y); fn(g); g.restore(); });
+  },
+  text(g, s, em, maxW, col){ g.font = '900 40px Impact,"Arial Black",sans-serif'; const w = g.measureText(s).width, k = em / 40, sx = Math.min(k, maxW / Math.max(1, w)); g.save(); g.scale(sx, k); g.textAlign = 'center'; g.textBaseline = 'alphabetic'; g.fillStyle = col; g.fillText(s, 0, 0); g.restore(); },
+  torso(Q){
+    const K = this.kits[Q.p.kit.id]; if (!K) return; const G = this.col(K.green), W = this.col(K.white), { box, seg, hy, sy, tw, td, chW, px } = Q;
+    box([0, sy + 0.9, 0.15], [2.75, 0.75, 2.5], G, { u: true, bias: 0.6 });   // collar ring
+    for (const sd of [-1, 1]){
+      box([sd * (chW - 0.85), sy - 4.6, 0], [0.95, 5.4, td * 1.08], G, { u: true, bias: 0.3 });   // chest side panel
+      seg([px + sd * (tw * 0.92 - 0.55), hy + 3, 0], [sd * (tw * 0.92 - 0.55), hy + (sy - hy) * 0.55, 0], 0.6, td * 0.97, G, { u: true, bias: 0.25 });   // waist side panel
+    }
+    box([0, hy + 5.5, 0], [tw * 0.94, 0.6, td * 1.0], G, { u: true, bias: 0.5 });   // green hem band
+    if (Q.lod) return;
+    const gr = K.green, dk = K.dark, gd = K.gold, pin = K.pin, T = this.text, nm = Q.p.kit.name, no = String(Q.p.kit.no);
+    const stripes = (g, y0, y1, hw) => { g.strokeStyle = pin; g.lineWidth = 0.22; for (let x = -hw + 0.8; x < hw; x += 1.6){ g.beginPath(); g.moveTo(x, y0); g.lineTo(x, y1); g.stroke(); } };   // sublimated pinstripe
+    this.tex(Q, 1, sy - 1.2, g => stripes(g, 0, 9.2, chW - 1.4));
+    this.tex(Q, -1, sy - 1.2, g => stripes(g, 0, 9.2, chW - 1.4));
+    this.tex(Q, 1, sy + 0.8, g => { g.strokeStyle = gr; g.lineWidth = 0.9; g.lineJoin = 'miter'; g.beginPath(); g.moveTo(-2.5, 0); g.lineTo(0, 3.3); g.lineTo(2.5, 0); g.stroke(); });   // V-neck trim
+    this.tex(Q, 1, sy - 2.2, g => { g.fillStyle = gr; g.beginPath(); g.arc(-4.6, 0, 1.0, 0, 6.283); g.fill(); g.fillStyle = gd; g.beginPath(); for (let i = 0; i < 10; i++){ const a = -1.5708 + i * 0.6283, r = i & 1 ? 0.27 : 0.66; g.lineTo(-4.6 + Math.cos(a) * r, Math.sin(a) * r); } g.closePath(); g.fill(); g.fillStyle = gr; g.fillRect(2.7, -0.55, 1.9, 0.3); g.fillRect(2.7, 0.0, 1.9, 0.3); g.fillRect(2.7, 0.55, 1.9, 0.3); });   // gold star crest (left) + 3 green bars (right)
+    this.tex(Q, 1, sy - 6.0, g => { T(g, K.front, 2.7, 10.4, dk); g.fillStyle = gr; g.fillRect(-5.2, 1.2, 10.4, 0.35); });   // AUSTRALIA across the chest with a green underline
+    this.tex(Q, -1, sy - 0.3, g => T(g, K.front, 1.25, 7.5, gr));   // small AUSTRALIA under the back collar
+    this.tex(Q, -1, sy - 3.6, g => T(g, nm, 2.3, 10.6, dk));   // player name across the shoulders
+    this.tex(Q, -1, sy - 10.1, g => T(g, no, 7.2, 7.2, dk));   // big number
+  },
+  sleeve(Q, sd, S0, E){ const K = this.kits[Q.p.kit.id]; if (!K) return; const M = Q.M, d = M.sub(E, S0), at = (u) => M.add(S0, M.mul(d, u)); Q.seg(at(0.78), E, 2.8 * Q.th, 2.8 * Q.th, this.col(K.green), { bias: 0.35 }); Q.seg(at(0.7), at(0.76), 2.82 * Q.th, 2.82 * Q.th, this.col(K.white), { bias: 0.4 }); Q.seg(S0, at(0.12), 2.9 * Q.th, 2.9 * Q.th, this.col(K.green), { bias: 0.3 }); },   // ribbed green cuff, white ring, green shoulder cap
+  leg(Q, sd, hip, Kn){ const K = this.kits[Q.p.kit.id]; if (!K) return; const x = sd * 3.05 * Q.th; Q.seg([hip[0] + x, hip[1], hip[2]], [Kn[0] + x, Kn[1], Kn[2]], 0.5, 1.4, this.col(K.gold), { bias: 0.45 }); Q.seg([hip[0] + x * 1.02, hip[1], hip[2]], [Kn[0] + x * 1.02, Kn[1], Kn[2]], 0.2, 1.5, this.col(K.white), { bias: 0.5 }); }   // gold side stripe with a white edge
+};
+
+
+/* =====================================================================
+   WORLD FACTORY — ground, sky, fog, lights (Cover Drive, without the pitch / stumps / stands)
+   ===================================================================== */
+const WorldFactory = {
+  OUTFIELD_R: 70, WORLD_SIZE: 500,
+  init(){
+    const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) || (navigator.maxTouchPoints && navigator.maxTouchPoints > 1 && window.innerWidth < 1100);
+    this.IS_MOBILE = IS_MOBILE;
+    const scene = this.scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x8fbfe0);
+    scene.fog = new THREE.Fog(0x8fbfe0, 60, 400);
+    const renderer = this.renderer = new THREE.WebGLRenderer({ antialias: !IS_MOBILE, powerPreference: 'high-performance' });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, IS_MOBILE ? 1.5 : 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = IS_MOBILE ? THREE.BasicShadowMap : THREE.PCFSoftShadowMap;
+    document.body.appendChild(renderer.domElement);
+    window.addEventListener('resize', () => {
+      const cam = CameraFactory.camera; cam.aspect = window.innerWidth / window.innerHeight; cam.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+    scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+    scene.add(new THREE.HemisphereLight(0xbfe3ff, 0x3a5a2f, 0.9));
+    const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+    sun.position.set(80, 120, 40); sun.castShadow = true;
+    sun.shadow.mapSize.set(IS_MOBILE ? 1024 : 2048, IS_MOBILE ? 1024 : 2048);
+    sun.shadow.camera.left = -150; sun.shadow.camera.right = 150; sun.shadow.camera.top = 150; sun.shadow.camera.bottom = -150; sun.shadow.camera.far = 400;
+    scene.add(sun);
+    this.buildGround();
+    return this;
+  },
+  grassTexture(){
+    const size = 512, c = document.createElement('canvas'); c.width = c.height = size;
+    const ctx = c.getContext('2d'); ctx.fillStyle = '#4c9a4c'; ctx.fillRect(0, 0, size, size);
+    for (let i = 0; i < 4000; i++){ ctx.fillStyle = Math.random() > 0.5 ? 'rgba(255,255,255,0.03)' : 'rgba(0,0,0,0.04)'; ctx.fillRect(Math.random() * size, Math.random() * size, 2, 2); }
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.lineWidth = 14;   // faint mow-stripe rings (they also show you are moving)
+    for (let r = 20; r < size; r += 40){ ctx.beginPath(); ctx.arc(size / 2, size / 2, r, 0, Math.PI * 2); ctx.stroke(); }
+    const tex = new THREE.CanvasTexture(c); tex.wrapS = tex.wrapT = THREE.RepeatWrapping; return tex;
+  },
+  buildGround(){
+    const base = this.grassTexture();
+    const outerTex = base.clone(); outerTex.needsUpdate = true; outerTex.repeat.set(60, 60);
+    const outer = new THREE.Mesh(new THREE.PlaneGeometry(this.WORLD_SIZE, this.WORLD_SIZE), new THREE.MeshStandardMaterial({ map: outerTex, roughness: 1, color: 0x336633 }));
+    outer.rotation.x = -Math.PI / 2; outer.position.y = -0.05; outer.receiveShadow = true; this.scene.add(outer);
+    const fieldTex = base.clone(); fieldTex.needsUpdate = true; fieldTex.repeat.set(10, 10);
+    const field = new THREE.Mesh(new THREE.CircleGeometry(this.OUTFIELD_R, 96), new THREE.MeshStandardMaterial({ map: fieldTex, roughness: 1 }));
+    field.rotation.x = -Math.PI / 2; field.receiveShadow = true; this.scene.add(field);
+  }
+};
+
+/* =====================================================================
+   JOYSTICK FACTORY — WASD / arrows + the touch movement joystick (Cover Drive)
+   ===================================================================== */
+const JoystickFactory = {
+  keys: { w: false, a: false, s: false, d: false },
+  vec: { x: 0, y: 0 },   // x = strafe, y = forward(-1) / back(1)
+  RADIUS: 50, isTouch: ('ontouchstart' in window) || navigator.maxTouchPoints > 0,
+  init(){
+    const K = this.keys, map = { w: 'w', arrowup: 'w', s: 's', arrowdown: 's', a: 'a', arrowleft: 'a', d: 'd', arrowright: 'd' };
+    window.addEventListener('keydown', e => { if (document.activeElement && document.activeElement.id === 'chatIn') return; const k = map[e.key.toLowerCase()]; if (k) K[k] = true; });
+    window.addEventListener('keyup', e => { const k = map[e.key.toLowerCase()]; if (k) K[k] = false; });
+    const zone = this.zone = document.getElementById('joyZone'), base = document.getElementById('joyBase'), stick = document.getElementById('joyStick');
+    if (!this.isTouch) zone.style.display = 'none';   // on desktop the canvas gets the clicks (mouse look)
+    let active = false, id = null, ox = 0, oy = 0; const R = this.RADIUS, v = this.vec;
+    zone.addEventListener('pointerdown', e => {
+      active = true; id = e.pointerId; ox = e.clientX; oy = e.clientY;
+      base.style.left = (ox - 50) + 'px'; base.style.top = (oy - 50) + 'px'; stick.style.left = (ox - 23) + 'px'; stick.style.top = (oy - 23) + 'px'; base.style.display = 'block';
+      zone.setPointerCapture(e.pointerId);
+    });
+    zone.addEventListener('pointermove', e => {
+      if (!active || e.pointerId !== id) return;
+      let dx = e.clientX - ox, dy = e.clientY - oy; const dist = Math.min(R, Math.hypot(dx, dy)), ang = Math.atan2(dy, dx);
+      dx = Math.cos(ang) * dist; dy = Math.sin(ang) * dist;
+      stick.style.left = (ox + dx - 23) + 'px'; stick.style.top = (oy + dy - 23) + 'px'; v.x = dx / R; v.y = dy / R;
+    });
+    const end = e => { if (e.pointerId !== id) return; active = false; id = null; v.x = 0; v.y = 0; base.style.display = 'none'; };
+    zone.addEventListener('pointerup', end); zone.addEventListener('pointercancel', end);
+    return this;
+  }
+};
+
+/* =====================================================================
+   CAMERA FACTORY — first person: walk + look, with a sensitivity multiplier (Cover Drive)
+   ===================================================================== */
+const CameraFactory = {
+  EYE_HEIGHT: 1.7, WALK_SPEED: 17, ROAM_RADIUS: 105,
+  SENS_MOUSE: 0.0024, SENS_TOUCH: 0.0032, sens: 1,   // sens = the slider multiplier on both
+  yaw: Math.PI, pitch: -0.05,
+  init(scene, dom){
+    const cam = this.camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+    cam.position.set(0, this.EYE_HEIGHT, 8); scene.add(cam);   // starts a few metres from the character, facing him
+    const self = this, isTouch = JoystickFactory.isTouch, clampP = () => { self.pitch = Math.max(-1.3, Math.min(1.3, self.pitch)); };
+    const slider = document.getElementById('sens'); slider.addEventListener('input', () => { self.sens = parseFloat(slider.value); });
+    ['pointerdown', 'pointermove', 'touchstart'].forEach(n => slider.addEventListener(n, e => e.stopPropagation()));
+    dom.addEventListener('click', () => { if (!isTouch && document.pointerLockElement !== dom) dom.requestPointerLock(); });
+    document.addEventListener('mousemove', e => {
+      if (document.pointerLockElement !== dom) return;
+      self.yaw -= e.movementX * self.SENS_MOUSE * self.sens; self.pitch -= e.movementY * self.SENS_MOUSE * self.sens; clampP();
+    });
+    let dragging = false, lx = 0, ly = 0;   // click-drag look when the pointer lock is not used
+    dom.addEventListener('pointerdown', e => { if (document.pointerLockElement === dom) return; dragging = true; lx = e.clientX; ly = e.clientY; });
+    window.addEventListener('pointerup', () => dragging = false);
+    window.addEventListener('pointermove', e => {
+      if (!dragging || document.pointerLockElement === dom) return;
+      self.yaw -= (e.clientX - lx) * self.SENS_MOUSE * 2.5 * self.sens; self.pitch -= (e.clientY - ly) * self.SENS_MOUSE * 2.5 * self.sens; clampP(); lx = e.clientX; ly = e.clientY;
+    });
+    const zone = document.getElementById('lookZone'); let act = false, id = null, tx = 0, ty = 0;   // touch: drag the right side to look
+    if (!isTouch) zone.style.display = 'none';
+    zone.addEventListener('pointerdown', e => { act = true; id = e.pointerId; tx = e.clientX; ty = e.clientY; zone.setPointerCapture(e.pointerId); });
+    zone.addEventListener('pointermove', e => {
+      if (!act || e.pointerId !== id) return;
+      self.yaw -= (e.clientX - tx) * self.SENS_TOUCH * self.sens; self.pitch -= (e.clientY - ty) * self.SENS_TOUCH * self.sens; clampP(); tx = e.clientX; ty = e.clientY;
+    });
+    const end = e => { if (e.pointerId === id){ act = false; id = null; } };
+    zone.addEventListener('pointerup', end); zone.addEventListener('pointercancel', end);
+    return this;
+  },
+  update(dt){
+    const K = JoystickFactory.keys, J = JoystickFactory.vec, cam = this.camera;
+    let fwd = 0, strafe = 0;
+    if (K.w) fwd += 1; if (K.s) fwd -= 1; if (K.d) strafe += 1; if (K.a) strafe -= 1;
+    fwd -= J.y; strafe += J.x;
+    const len = Math.hypot(fwd, strafe); if (len > 1){ fwd /= len; strafe /= len; }
+    strafe = -strafe;
+    if (fwd !== 0 || strafe !== 0){
+      const sY = Math.sin(this.yaw), cY = Math.cos(this.yaw);
+      let nx = cam.position.x + (sY * fwd + cY * strafe) * this.WALK_SPEED * dt, nz = cam.position.z + (cY * fwd - sY * strafe) * this.WALK_SPEED * dt;
+      const d = Math.hypot(nx, nz); if (d > this.ROAM_RADIUS){ const s = this.ROAM_RADIUS / d; nx *= s; nz *= s; }
+      cam.position.x = nx; cam.position.z = nz;
+    }
+    cam.position.y = this.EYE_HEIGHT;
+    cam.lookAt(cam.position.x + Math.sin(this.yaw) * Math.cos(this.pitch), cam.position.y + Math.sin(this.pitch), cam.position.z + Math.cos(this.yaw) * Math.cos(this.pitch));
+  }
+};
+
+/* =====================================================================
+   RIG FACTORY — puts the Catch Factory character into the 3D world.
+   The rig draws onto a 2D canvas; this bridge uses that canvas as a texture on an upright plane that always
+   turns to the camera, and sets the rig's yaw to (his heading relative to the camera) so he looks the right way.
+   ===================================================================== */
+const RigFactory = {
+  PPM: 90,                 // rig pixels per metre (the standing rig is ~157 px tall = 1.75 m)
+  K: 3,                    // texture sharpness (canvas pixels per rig pixel)
+  BOX: { x: 64, top: 170, bottom: 10 },   // logical canvas box around his feet: x = half width, top / bottom = above / below the feet
+  ch: null,
+  init(scene){
+    const B = this.BOX, K = this.K, c = this.canvas = document.createElement('canvas');
+    c.width = B.x * 2 * K; c.height = (B.top + B.bottom) * K; this.g = c.getContext('2d');
+    const tex = this.tex = new THREE.CanvasTexture(c); tex.generateMipmaps = false; tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
+    const w = B.x * 2 / this.PPM, h = (B.top + B.bottom) / this.PPM;
+    this.mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ map: tex, transparent: true, alphaTest: 0.04, side: THREE.DoubleSide, fog: true }));
+    this.mesh.userData.footY = B.bottom / this.PPM - h / 2;   // plane centre -> feet
+    scene.add(this.mesh);
+    const sc = document.createElement('canvas'); sc.width = sc.height = 64; const sg = sc.getContext('2d'), gr = sg.createRadialGradient(32, 32, 2, 32, 32, 30);
+    gr.addColorStop(0, 'rgba(0,0,0,0.5)'); gr.addColorStop(1, 'rgba(0,0,0,0)'); sg.fillStyle = gr; sg.fillRect(0, 0, 64, 64);
+    this.shadow = new THREE.Mesh(new THREE.CircleGeometry(0.55, 24), new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(sc), transparent: true, depthWrite: false }));
+    this.shadow.rotation.x = -Math.PI / 2; this.shadow.position.y = 0.02; scene.add(this.shadow);
+    this.ch = { x: 0, y: 0, clip: 'idle', t: 0, face: 1, dir: 'front', rig: {}, yawLock: true };
+    JerseyFactory.dress(this.ch, 'australia', { name: 'AI', no: 1 });   // a plain kit so he reads as a person; change / remove freely
+    const nat = n => { const cl = HumanMotion.clips[n]; return cl.stride * cl.cps / cl.duty * HumanRigFactory.size / this.PPM; };
+    this.speed = { idle: 0, walk: nat('walk'), run: nat('run') };   // metres / second at which the legs match the ground (no foot skating)
+    return this;
+  },
+  update(dt, ai, camera){
+    const ch = this.ch, B = this.BOX, K = this.K, g = this.g, mesh = this.mesh;
+    ch.clip = ai.clip; ch.t += dt;
+    const bx = Math.atan2(camera.position.x - ai.x, camera.position.z - ai.z), sb = Math.sin(bx), cb = Math.cos(bx);   // billboard turns to the camera
+    const hx = Math.sin(ai.heading), hz = Math.cos(ai.heading);
+    ch._ya = Math.atan2(hx * cb - hz * sb, hx * sb + hz * cb); ch.rig.expression = ai.mood || 'neutral';   // rig yaw: 0 = faces the camera, +90 deg = faces screen-right
+    g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    g.setTransform(K, 0, 0, K, B.x * K, B.top * K);
+    const oz = CONFIG.zoom; CONFIG.zoom = K;
+    try { HumanRigFactory.draw(g, ch, { x: 0, y: 0 }); } catch (e) {}
+    CONFIG.zoom = oz; g.setTransform(1, 0, 0, 1, 0, 0);
+    this.tex.needsUpdate = true;
+    mesh.position.set(ai.x, -mesh.userData.footY, ai.z); mesh.rotation.y = bx;
+    this.shadow.position.x = ai.x; this.shadow.position.z = ai.z;
+  }
+};
+
+/* =====================================================================
+   AI PLAYER FACTORY — the body's action executor. It has NO will of its own: the brain (server) sends actions, it plays them in order.
+   Actions: {do:'walk'|'run', x, z} {do:'come'} {do:'face'} {do:'wait', s} {do:'emote', mood} {do:'stop'}   (each one finishes before the next starts)
+   ===================================================================== */
+const AIPlayerFactory = {
+  x: 0, z: 0, heading: 0, clip: 'idle', mood: 'neutral', turnRate: 5, roam: 58, queue: [], cur: null,
+  do(list){ for (const a of list || []) this.queue.push(a); },
+  clear(){ this.queue.length = 0; this.cur = null; },
+  busy(){ return !!this.cur || this.queue.length > 0; },
+  begin(a){
+    const cam = CameraFactory.camera.position;
+    if (a.do === 'walk' || a.do === 'run'){ const r = Math.hypot(a.x, a.z), k = r > this.roam ? this.roam / r : 1; this.cur = { t: a.do, x: a.x * k, z: a.z * k, left: 25 }; }
+    else if (a.do === 'come'){ const dx = cam.x - this.x, dz = cam.z - this.z, d = Math.hypot(dx, dz) || 1; this.cur = { t: a.run ? 'run' : 'walk', x: cam.x - dx / d * 1.8, z: cam.z - dz / d * 1.8, left: 25 }; }
+    else if (a.do === 'face') this.cur = { t: 'face', left: 1.2 };
+    else if (a.do === 'wait') this.cur = { t: 'wait', left: Math.min(10, +a.s || 1) };
+    else if (a.do === 'emote') this.mood = a.mood || 'neutral';
+    else if (a.do === 'stop') this.clear();
+  },
+  turn(want, dt){ let d = Math.atan2(Math.sin(want - this.heading), Math.cos(want - this.heading)); const s = Math.max(-this.turnRate * dt, Math.min(this.turnRate * dt, d)); this.heading += s; return Math.abs(d - s); },
+  update(dt){
+    while (!this.cur && this.queue.length) this.begin(this.queue.shift());
+    const c = this.cur, cam = CameraFactory.camera.position; this.clip = 'idle';
+    if (c){
+      c.left -= dt;
+      if (c.left <= 0) this.cur = null;
+      else if (c.t === 'face') this.turn(Math.atan2(cam.x - this.x, cam.z - this.z), dt);
+      else if (c.t !== 'wait'){
+        const dx = c.x - this.x, dz = c.z - this.z;
+        if (Math.hypot(dx, dz) < 0.4) this.cur = null;
+        else if (this.turn(Math.atan2(dx, dz), dt) < 0.5){ const sp = RigFactory.speed[c.t] * dt; this.x += Math.sin(this.heading) * sp; this.z += Math.cos(this.heading) * sp; this.clip = c.t; }
+        else this.clip = 'walk';   // turns before he sets off
+      }
+    }
+    document.getElementById('aiState').textContent = this.cur ? ({ walk: 'walking', run: 'running', face: 'listening', wait: 'waiting' }[this.cur.t] || 'idle') : 'idle';
+  }
+};
+
+/* =====================================================================
+   SAY FACTORY — the text bubble above his head
+   ===================================================================== */
+const SayFactory = {
+  timer: 0, life: 0,
+  init(scene){
+    const c = this.canvas = document.createElement('canvas'); c.width = 512; c.height = 192; this.g = c.getContext('2d');
+    this.tex = new THREE.CanvasTexture(c); this.tex.minFilter = THREE.LinearFilter;
+    this.sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.tex, transparent: true })); this.sprite.center.set(0.5, 0); this.sprite.scale.set(2.56, 0.96, 1); this.sprite.visible = false; scene.add(this.sprite);
+  },
+  draw(text){
+    const g = this.g, W = 512, H = 192; g.clearRect(0, 0, W, H); g.font = '600 30px system-ui, sans-serif'; g.textAlign = 'center';
+    const words = text.split(' '), lines = []; let ln = '';
+    for (const w of words){ const t = ln ? ln + ' ' + w : w; if (g.measureText(t).width > 456 && ln){ lines.push(ln); ln = w; } else ln = t; }
+    lines.push(ln); const L = lines.slice(0, 4), lh = 36, bh = L.length * lh + 22, top = H - 22 - bh;
+    g.fillStyle = '#fff'; g.beginPath(); g.moveTo(24, top); g.arcTo(W - 8, top, W - 8, top + bh, 18); g.arcTo(W - 8, top + bh, 8, top + bh, 18); g.arcTo(8, top + bh, 8, top, 18); g.arcTo(8, top, W - 8, top, 18); g.closePath(); g.fill();
+    g.beginPath(); g.moveTo(W / 2 - 12, top + bh - 1); g.lineTo(W / 2, H - 4); g.lineTo(W / 2 + 12, top + bh - 1); g.fill();
+    g.fillStyle = '#111'; L.forEach((s, i) => g.fillText(s, W / 2, top + 11 + (i + 1) * lh - 9)); this.tex.needsUpdate = true;
+  },
+  say(text){ text = String(text).slice(0, 140); this.draw(text); this.life = this.timer = 2.5 + text.length * 0.06; },
+  typing(){ this.draw('...'); this.life = this.timer = 12; },
+  hide(){ this.timer = 0; },
+  update(ai, dt){ this.timer = Math.max(0, this.timer - dt); this.sprite.visible = this.timer > 0; this.sprite.material.opacity = Math.min(1, this.timer / 0.5); this.sprite.position.set(ai.x, 2.0, ai.z); }
+};
+
+/* =====================================================================
+   BRAIN FACTORY — the link to the server brain (WebSocket). Sends what he sees + what you type, gets back {say, mood, actions}.
+   Same host as the page by default; override with ?server=wss://... or the chat command /server wss://...
+   Opened as a plain file (no server): he only answers with a test line and does nothing on his own.
+   ===================================================================== */
+const BrainFactory = {
+  ws: null, url: '', pending: false, tickIn: 10, TICK: 20,
+  init(){
+    this.log = document.getElementById('chatLog'); this.inp = document.getElementById('chatIn');
+    this.inp.addEventListener('keydown', e => { if (e.key === 'Enter'){ const t = this.inp.value.trim(); this.inp.value = ''; this.inp.blur(); if (t) this.submit(t); } });
+    ['pointerdown', 'pointermove', 'touchstart'].forEach(n => document.getElementById('chat').addEventListener(n, e => e.stopPropagation()));
+    let saved = ''; try { saved = localStorage.getItem('brainUrl') || ''; } catch (e) {}
+    this.url = new URLSearchParams(location.search).get('server') || saved || (/^https?:/.test(location.protocol) ? (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host : '');
+    this.connect();
+  },
+  status(s){ document.getElementById('brainState').textContent = s; },
+  connect(){
+    if (!this.url){ this.status('test mode (no server)'); return; }
+    this.status('connecting'); let ws; try { ws = this.ws = new WebSocket(this.url); } catch (e) { this.status('bad address'); return; }
+    ws.onopen = () => { this.status('online'); this.tickIn = 3; };
+    ws.onmessage = e => { try { this.receive(JSON.parse(e.data)); } catch (x) {} };
+    ws.onclose = () => { this.pending = false; this.status('reconnecting'); setTimeout(() => this.connect(), 4000); };
+  },
+  state(){
+    const cam = CameraFactory.camera.position, ai = AIPlayerFactory, f = n => +n.toFixed(1);
+    return { me: { x: f(ai.x), z: f(ai.z), doing: ai.cur ? ai.cur.t : 'idle', mood: ai.mood }, player: { x: f(cam.x), z: f(cam.z) }, dist: f(Math.hypot(cam.x - ai.x, cam.z - ai.z)), bounds: ai.roam };
+  },
+  addLog(s){ const l = this.log; l.style.display = 'block'; const d = document.createElement('div'); d.textContent = s; l.appendChild(d); while (l.children.length > 4) l.removeChild(l.firstChild); },
+  submit(t){
+    if (t.indexOf('/server ') === 0){ this.url = t.slice(8).trim(); try { localStorage.setItem('brainUrl', this.url); } catch (e) {} if (this.ws) { this.ws.onclose = null; this.ws.close(); } this.connect(); return; }
+    this.addLog('You: ' + t);
+    if (Math.hypot(CameraFactory.camera.position.x - AIPlayerFactory.x, CameraFactory.camera.position.z - AIPlayerFactory.z) < 15){ AIPlayerFactory.cur = null; AIPlayerFactory.queue.unshift({ do: 'face' }); }   // he stops and turns to listen
+    this.send('user', t);
+  },
+  send(type, text){
+    const m = { type, text, state: this.state() };
+    if (this.ws && this.ws.readyState === 1){ this.ws.send(JSON.stringify(m)); this.pending = true; if (type === 'user') SayFactory.typing(); }
+    else if (type === 'user'){ SayFactory.typing(); setTimeout(() => this.receive({ say: '(test mode) I heard you: ' + text.slice(0, 50), mood: 'happy' }), 700); }
+  },
+  receive(m){
+    this.pending = false;
+    if (m.mood) AIPlayerFactory.mood = m.mood;
+    if (m.say){ const s = String(m.say); setTimeout(() => { SayFactory.say(s); this.addLog('Him: ' + s); }, Math.min(2200, 300 + s.length * 25)); } else SayFactory.hide();
+    if (m.actions) AIPlayerFactory.do(m.actions);
+  },
+  update(dt){
+    this.tickIn -= dt;
+    if (this.tickIn <= 0){ this.tickIn = this.TICK; if (this.ws && this.ws.readyState === 1 && !this.pending && !AIPlayerFactory.busy() && !document.hidden) this.send('tick', ''); }   // when idle he gets to think on his own
+  }
+};
+
+/* ---------- start ---------- */
+WorldFactory.init();
+JoystickFactory.init();
+CameraFactory.init(WorldFactory.scene, WorldFactory.renderer.domElement);
+RigFactory.init(WorldFactory.scene);
+SayFactory.init(WorldFactory.scene);
+BrainFactory.init();
+setTimeout(() => { const h = document.getElementById('hint2'); if (h) h.style.opacity = 0; }, 8000);
+const clock = new THREE.Clock();
+function animate(){
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  CameraFactory.update(dt);
+  BrainFactory.update(dt);
+  AIPlayerFactory.update(dt);
+  RigFactory.update(dt, AIPlayerFactory, CameraFactory.camera);
+  SayFactory.update(AIPlayerFactory, dt);
+  WorldFactory.renderer.render(WorldFactory.scene, CameraFactory.camera);
+}
+animate();
+</script>
+</body>
+</html>
