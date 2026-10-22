@@ -6,16 +6,16 @@ const PERSONA = E.PERSONA || `You are ${NAME}, a real young person standing in a
 const app = express(); app.use(express.static(path.join(__dirname, 'public')));
 const server = http.createServer(app), wss = new WebSocketServer({ server });
 
-// ---- memory: Supabase table `memories`; falls back to RAM when SUPABASE_URL / SUPABASE_KEY are not set ----
-const SB = E.SUPABASE_URL && E.SUPABASE_KEY, ram = { fact: [], chat: [], lesson: [], skill: [], summary: [] };
+// ---- memory: Supabase table `character_memories`; falls back to RAM when SUPABASE_URL / SUPABASE_KEY are not set ----
+const TABLE = E.SUPABASE_TABLE || 'character_memories', SB = E.SUPABASE_URL && E.SUPABASE_KEY, ram = { fact: [], chat: [], lesson: [], skill: [], summary: [] };
 const sb = (p, o = {}) => fetch(E.SUPABASE_URL + '/rest/v1/' + p, { ...o, headers: { apikey: E.SUPABASE_KEY, Authorization: 'Bearer ' + E.SUPABASE_KEY, 'Content-Type': 'application/json', Prefer: 'return=minimal' } });
 async function load(kind, n) {
   if (!SB) return (ram[kind] || []).slice(-n);
-  try { const r = await sb(`memories?kind=eq.${kind}&select=content&order=id.desc&limit=${n}`); return (await r.json()).map(x => x.content).reverse(); } catch (e) { return (ram[kind] || []).slice(-n); }
+  try { const r = await sb(`${TABLE}?kind=eq.${kind}&select=content&order=id.desc&limit=${n}`); const j = await r.json(); if (!Array.isArray(j)) throw new Error(JSON.stringify(j).slice(0, 150)); return j.map(x => x.content).reverse(); } catch (e) { console.log('memory load failed:', kind, e.message); return (ram[kind] || []).slice(-n); }
 }
 async function save(kind, content) {
   (ram[kind] = ram[kind] || []).push(content); if (ram[kind].length > 200) ram[kind].shift();
-  if (SB) try { await sb('memories', { method: 'POST', body: JSON.stringify({ kind, content }) }); } catch (e) {}
+  if (SB) try { const r = await sb(TABLE, { method: 'POST', body: JSON.stringify({ kind, content }) }); if (!r.ok) console.log('memory save failed:', kind, r.status, (await r.text()).slice(0, 150)); } catch (e) { console.log('memory save error:', e.message); }
 }
 
 // ---- AI providers: Groq first, Gemini + OpenRouter as fallbacks (set whichever keys you have) ----
