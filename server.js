@@ -19,24 +19,24 @@ async function save(kind, content) {
 }
 
 // ---- AI providers: Groq first, Gemini + OpenRouter as fallbacks (set whichever keys you have) ----
-const groqCall = key => async (sys, user) => {
+const groqCall = key => async (sys, user, hist = []) => {
   const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
-    body: JSON.stringify({ model: E.GROQ_MODEL || 'openai/gpt-oss-20b', temperature: 0.9, max_tokens: 1200, reasoning_effort: 'low', response_format: { type: 'json_object' }, messages: [{ role: 'system', content: sys }, { role: 'user', content: user }] }) });
+    body: JSON.stringify({ model: E.GROQ_MODEL || 'openai/gpt-oss-20b', temperature: 0.9, max_tokens: 1200, reasoning_effort: 'low', response_format: { type: 'json_object' }, messages: [{ role: 'system', content: sys }, ...hist, { role: 'user', content: user }] }) });
   const j = await r.json(); if (!r.ok) throw new Error(JSON.stringify(j).slice(0, 200));
   return j.choices[0].message.content;
 };
-async function gemini(sys, user) {
+async function gemini(sys, user, hist = []) {
   const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${E.GEMINI_MODEL || 'gemini-2.5-flash'}:generateContent?key=${E.GEMINI_API_KEY}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ systemInstruction: { parts: [{ text: sys }] }, contents: [{ role: 'user', parts: [{ text: user }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.9, maxOutputTokens: 1500 } }) });
+    body: JSON.stringify({ systemInstruction: { parts: [{ text: sys }] }, contents: [...hist.map(h => ({ role: h.role === 'assistant' ? 'model' : 'user', parts: [{ text: h.content }] })), { role: 'user', parts: [{ text: user }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.9, maxOutputTokens: 1500 } }) });
   const j = await r.json(); if (!r.ok) throw new Error(JSON.stringify(j).slice(0, 200));
   return j.candidates[0].content.parts.map(p => p.text || '').join('');
 }
-async function openrouter(sys, user) {
+async function openrouter(sys, user, hist = []) {
   const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + E.OPENROUTER_API_KEY },
-    body: JSON.stringify({ model: E.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free', temperature: 0.9, max_tokens: 500, messages: [{ role: 'system', content: sys }, { role: 'user', content: user }] }) });
+    body: JSON.stringify({ model: E.OPENROUTER_MODEL || 'meta-llama/llama-3.3-70b-instruct:free', temperature: 0.9, max_tokens: 500, messages: [{ role: 'system', content: sys }, ...hist, { role: 'user', content: user }] }) });
   const j = await r.json(); if (!r.ok) throw new Error(JSON.stringify(j).slice(0, 200));
   return j.choices[0].message.content;
 }
@@ -50,6 +50,7 @@ const providers = [
 ];
 const cool = {};   // provider name -> time until which it rests after hitting a limit
 const rest = (name, msg) => { cool[name] = Date.now() + (/per day|daily|TPD|RPD/i.test(msg) ? 30 * 60000 : /40[13]|invalid|does not exist|access/i.test(msg) ? 10 * 60000 : 65000); };
+console.log('memory:', SB ? 'Supabase table ' + TABLE : 'RAM only (SUPABASE_URL / SUPABASE_KEY not found)');
 console.log('providers in order:', providers.map(p => p.name).join(' > ') || 'none');
 
 // ---- body vocabulary: the AI may use any of these, and can INVENT new moves with the `move` action (motion numbers, clamped to safe ranges) ----
@@ -60,11 +61,11 @@ const clean = list => (Array.isArray(list) ? list : []).filter(a => a && DOS.inc
   if (a.do === 'move') { o.name = String(a.name || 'move').replace(/\W/g, '').slice(0, 20) || 'move'; o.p = {}; for (const k in PK) if (a.p && isFinite(+a.p[k]) && a.p[k] !== null) o.p[k] = Math.max(PK[k][0], Math.min(PK[k][1], +a.p[k])); }
   return o; });
 const why = m => /429|quota|RESOURCE_EXHAUSTED|rate limit/i.test(m) ? 'quota / rate limit used up' : /503|UNAVAILABLE|overloaded/i.test(m) ? 'busy' : /404|does not exist|not have access/i.test(m) ? 'model name rejected' : /40[13]|API key|auth/i.test(m) ? 'key rejected' : m.slice(0, 60);
-async function callAI(sys, user, prog = () => {}) {   // walks the provider chain (Groq keys > OpenRouter > Gemini), skipping resting ones
+async function callAI(sys, user, prog = () => {}, hist = []) {   // walks the provider chain (Groq keys > OpenRouter > Gemini), skipping resting ones
   const now0 = Date.now(), ready = providers.filter(p => (cool[p.name] || 0) <= now0), order = ready.length ? ready : providers, errs = []; let raw = '';
   outer: for (const p of order) {
     for (let i = 0; i < 2; i++) {
-      try { raw = await p.fn(sys, user); console.log('ai ok:', p.name); break outer; }
+      try { raw = await p.fn(sys, user, hist); console.log('ai ok:', p.name); break outer; }
       catch (e) { console.log('provider failed:', p.name, e.message.slice(0, 120));
         if (/503|UNAVAILABLE|overloaded/i.test(e.message) && !/429|quota|rate limit/i.test(e.message) && i === 0) { prog('AI busy, retry'); await new Promise(r => setTimeout(r, 800)); continue; }
         errs.push(p.name + ': ' + why(e.message)); rest(p.name, e.message); break; }
@@ -72,6 +73,7 @@ async function callAI(sys, user, prog = () => {}) {   // walks the provider chai
   }
   return { raw, errs };
 }
+const turns = lines => { const out = []; for (const l of lines) { const me = l.indexOf(NAME + ': ') === 0, c = me ? JSON.stringify({ say: l.slice(NAME.length + 2) }) : l.replace(/^Player: /, ''), role = me ? 'assistant' : 'user', t = out[out.length - 1]; if (t && t.role === role) t.content += '\n' + c; else out.push({ role, content: c }); } return out; };   // past chat as real alternating turns, which models follow far better than a text block
 const latest = arr => { const m = new Map(); for (const x of arr) { try { const o = JSON.parse(x); if (o && o.name) m.set(o.name, o); } catch (e) {} } return [...m.values()]; };   // newest version of each skill
 let used = 0, day = new Date().getUTCDate(), sinceSum = 0;
 async function summarise() {   // every ~25 chat lines: fold old talk into a short summary so he remembers weeks, not minutes
@@ -86,9 +88,9 @@ async function think(msg, ws) {
   if (used >= DAILY) return { status: 'error', detail: 'daily limit reached' };
   used++; prog('thinking...');
   const [facts, chat, lessons, skillsRaw, sum] = await Promise.all([load('fact', 30), load('chat', 20), load('lesson', 15), load('skill', 40), load('summary', 1)]), s = msg.state || {}, skills = latest(skillsRaw);
-  const sys = `${PERSONA}\n\nOlder memory (summary):\n${sum[0] || '(none yet)'}\n\nThings you remember:\n${facts.map(f => '- ' + f).join('\n') || '(nothing yet)'}\n\nLessons from your past mistakes (follow them):\n${lessons.map(f => '- ' + f).join('\n') || '(none yet)'}\n\nSkills you already learned (reuse by copying their actions):\n${skills.map(k => k.name + ': ' + JSON.stringify(k.actions)).join('\n') || '(none yet)'}\n\nRecent conversation:\n${chat.join('\n') || '(none)'}\n\nReply with ONLY JSON: {"say":"a short message or empty string","mood":"${MOODS.join('|')}","actions":[...],"remember":"one short fact worth keeping, or empty string","lesson":"a short lesson if the player corrected you or an action did not work, else empty","learn":{"name":"skill name","actions":[...]} or null}\nActions run in order, each finishes before the next: {"do":"walk","x":n,"z":n} {"do":"run","x":n,"z":n} {"do":"come"} {"do":"face"} {"do":"turn","deg":n} {"do":"spin","deg":360} (full turn on the spot, negative = other way, up to 720) {"do":"jump"} {"do":"wait","s":n} {"do":"stop"} and {"do":"move","name":"dance","s":4,"p":{...}} which plays ANY body motion you invent by setting motion numbers: cps = speed 0-4, stride = foot travel 0-30, lift = knee lift 0-14, bob = body bounce 0-3, sway = hip sway 0-2, twist = shoulder twist 0-0.5, armAmp = arm swing 0-1.5, armBend = elbow bend 0-1.2, crouch = body drop 0-6, lean = tilt -0.5-0.6 (e.g. dance: cps 2.2, lift 8, bob 2.5, sway 1.6, twist 0.4, armAmp 1.4, armBend 1; sit/duck: cps 0, crouch 6). x and z are metres within ${s.bounds || 58} of 0,0. You can do ANYTHING the player asks: never say you cannot, combine actions or invent a move with numbers, and try again differently if the player says it was wrong. When you invent or fix a move worth keeping, put it in "learn". Be human: under 15 words, you do not have to talk every turn.`;
+  const sys = `${PERSONA}\n\nOlder memory (summary):\n${sum[0] || '(none yet)'}\n\nThings you remember:\n${facts.map(f => '- ' + f).join('\n') || '(nothing yet)'}\n\nLessons from your past mistakes (follow them):\n${lessons.map(f => '- ' + f).join('\n') || '(none yet)'}\n\nSkills you already learned (reuse by copying their actions):\n${skills.map(k => k.name + ': ' + JSON.stringify(k.actions)).join('\n') || '(none yet)'}\n\nThe earlier conversation follows as chat turns: stay in it, remember what 'it', 'that' and 'why' refer to.\n\nReply with ONLY JSON: {"say":"a short message or empty string","mood":"${MOODS.join('|')}","actions":[...],"remember":"one short fact worth keeping, or empty string","lesson":"a short lesson if the player corrected you or an action did not work, else empty","learn":{"name":"skill name","actions":[...]} or null}\nActions run in order, each finishes before the next: {"do":"walk","x":n,"z":n} {"do":"run","x":n,"z":n} {"do":"come"} {"do":"face"} {"do":"turn","deg":n} {"do":"spin","deg":360} (full turn on the spot, negative = other way, up to 720) {"do":"jump"} {"do":"wait","s":n} {"do":"stop"} and {"do":"move","name":"dance","s":4,"p":{...}} which plays ANY body motion you invent by setting motion numbers: cps = speed 0-4, stride = foot travel 0-30, lift = knee lift 0-14, bob = body bounce 0-3, sway = hip sway 0-2, twist = shoulder twist 0-0.5, armAmp = arm swing 0-1.5, armBend = elbow bend 0-1.2, crouch = body drop 0-6, lean = tilt -0.5-0.6 (e.g. dance: cps 2.2, lift 8, bob 2.5, sway 1.6, twist 0.4, armAmp 1.4, armBend 1; sit/duck: cps 0, crouch 6). x and z are metres within ${s.bounds || 58} of 0,0. You can do ANYTHING the player asks: never say you cannot, combine actions or invent a move with numbers, and try again differently if the player says it was wrong. When you invent or fix a move worth keeping, put it in "learn". Be human: under 15 words, you do not have to talk every turn.`;
   const who = msg.type === 'user' ? `The player says: "${String(msg.text).slice(0, 300)}"` : 'Nothing was said. Time passed. Do whatever you feel like (or nothing).';
-  const { raw, errs } = await callAI(sys, `${who}\nState: ${JSON.stringify(s)}`, prog);
+  const { raw, errs } = await callAI(sys, `${who}\nState: ${JSON.stringify(s)}`, prog, turns(chat));
   if (!raw) return { status: 'error', detail: errs.join(' | ') || 'AI unreachable' };
   let o = {}; try { const j = raw.match(/\{[\s\S]*\}/); o = JSON.parse(j ? j[0] : raw); } catch (e) { if (raw.indexOf('{') < 0) o = { say: raw.trim() }; else return { status: 'error', detail: 'AI sent an unreadable reply' }; }
   const acts = clean(o.actions), say = typeof o.say === 'string' ? o.say.slice(0, 140) : '', mood = MOODS.includes(o.mood) ? o.mood : 'neutral';
