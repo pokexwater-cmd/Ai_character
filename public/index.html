@@ -514,7 +514,7 @@ const AIPlayerFactory = {
   busy(){ return !!this.cur || this.queue.length > 0; },
   lbl(t){ if (t !== this._l){ this._l = t; (this._e = this._e || document.getElementById('aiState')).textContent = t; } },   // DOM text only when it changes
   begin(a){
-    const cam = CameraFactory.camera.position; this.hist = this.hist.concat(a.do).slice(-5);
+    const cam = CameraFactory.camera.position; this.hist = this.hist.concat(a.do).slice(-5); if (this.fs && FightFactory.on) this.fs.use[a.do] = (this.fs.use[a.do] || 0) + 1;   // fight stats: what he really DID
     if (a.do === 'spin'){ const d = Math.max(-720, Math.min(720, +a.deg || 360)); this.cur = { t: 'spin', rem: Math.abs(d) * Math.PI / 180, sg: d < 0 ? -1 : 1, left: 9 }; }
     else if (a.do === 'jump') this.cur = { t: 'jump', left: 0.7, T: 0.7 };
     else if (a.do === 'punch' || a.do === 'heavy' || a.do === 'shoot'){ const cost = { punch: 8, heavy: 18, shoot: 5 }[a.do]; if (this.sta !== undefined){ if (this.sta < cost){ this.cur = { t: 'wait', left: 0.4 }; return; } this.sta -= cost; } this.cur = a.do === 'punch' ? { t: 'punch', left: 0.4, hit: false } : a.do === 'heavy' ? { t: 'heavy', left: 0.9, hit: false } : { t: 'shoot', left: 0.4, fired: false }; }
@@ -667,7 +667,7 @@ const FightFactory = {
   snd(fr, du, ty){ try { const A = this.ac || (this.ac = new (window.AudioContext || window.webkitAudioContext)()), o = A.createOscillator(), g = A.createGain(); o.type = ty || 'sine'; o.frequency.value = fr; g.gain.value = 0.07; o.connect(g); g.connect(A.destination); o.start(); g.gain.exponentialRampToValueAtTime(0.0001, A.currentTime + du); o.stop(A.currentTime + du); } catch (e) {} },
   start(){ const A = AIPlayerFactory, B = AIPlayerFactory2; B.x = A.x + 4; B.z = A.z; A.heading = Math.PI / 2; B.heading = -Math.PI / 2; this.reset(); this.on = true; this.T = 0; this.tk = [0, 1.2]; this.pend = [0, 0]; BrainFactory.addLog('FIGHT!'); },
   reset(){
-    [AIPlayerFactory, AIPlayerFactory2].forEach((f, i) => Object.assign(f, { hp: 100, sta: 100, ko: false, flash: 0, inv: 0, cd: 0.4 + i * 0.5, dcd: 0, rec: 0, stun: 0, dash: null, cur: null, mood: 'neutral', pr: null, after: null, em: null, emT: 0, ev: [], seen: { dodge: 0, block: 0, hit: 0 }, pers: this.PERS[i], tac: i ? { mode: 'melee', aggr: 0.85, dodge: 0.3 } : { mode: 'melee', aggr: 0.5, dodge: 0.6 } }, { queue: [] }));
+    [AIPlayerFactory, AIPlayerFactory2].forEach((f, i) => Object.assign(f, { hp: 100, sta: 100, ko: false, flash: 0, inv: 0, cd: 0.4 + i * 0.5, dcd: 0, rec: 0, stun: 0, dash: null, cur: null, mood: 'neutral', pr: null, after: null, em: null, emT: 0, ev: [], seen: { dodge: 0, block: 0, hit: 0 }, fs: { use: {}, hit: {}, dmg: {}, blk: 0, taken: 0 }, pers: this.PERS[i], tac: i ? { mode: 'melee', aggr: 0.85, dodge: 0.3, w: {}, range: null, hold: false } : { mode: 'melee', aggr: 0.5, dodge: 0.6, w: {}, range: null, hold: false } }, { queue: [] }));
     this.bl.forEach(b => { b.on = false; b.m.visible = false; });
   },
   stop(){ this.on = false; this.reset(); },
@@ -675,7 +675,7 @@ const FightFactory = {
   dmg(a, f, n, kind){   // the ONE place damage is applied
     if (!this.on || f.ko || f.inv > 0) return false;
     const bl = f.cur && f.cur.t === 'block' && f.sta > 0; let m = bl ? (kind === 'heavy' ? 0.6 : kind === 'bullet' ? 0.4 : 0.15) : 1; if (f.rec > 0 && !bl) m *= 1.3;   // a foe who just swung is open to a counter
-    this.quiet = 0; const v = Math.max(1, Math.round(n * m)); f.hp = Math.max(0, f.hp - v); f.flash = bl ? 0.12 : 0.45; this.hs = bl ? 0.03 : 0.07; this.snd(bl ? 300 : 110, 0.08, bl ? 'square' : 'sine');
+    this.quiet = 0; const v = Math.max(1, Math.round(n * m)); f.hp = Math.max(0, f.hp - v); if (a.fs){ if (bl) a.fs.blk++; else { a.fs.hit[kind] = (a.fs.hit[kind] || 0) + 1; a.fs.dmg[kind] = (a.fs.dmg[kind] || 0) + v; } } if (f.fs) f.fs.taken += v; f.flash = bl ? 0.12 : 0.45; this.hs = bl ? 0.03 : 0.07; this.snd(bl ? 300 : 110, 0.08, bl ? 'square' : 'sine');
     if (bl){ a.seen.block++; this.note(a, 'he blocked your ' + kind); this.note(f, 'you blocked a ' + kind); f.sta = Math.max(0, f.sta - (kind === 'heavy' ? 25 : 6)); if (kind === 'heavy'){ f.cur = null; f.stun = 0.3; } }
     else { a.seen.hit++; this.note(a, 'you landed a ' + kind + ' (' + v + ')'); this.note(f, 'you took a ' + kind + ' (' + v + ')'); f.cur = null; f.queue.length = 0; f.stun = kind === 'heavy' ? 0.5 : 0.3; f.dash = { vx: Math.sin(a.heading) * 3.5, vz: Math.cos(a.heading) * 3.5, t: 0.18 }; f.after = Math.random() < f.pers.courage && f.hp > 30 ? 'counter' : 'back'; }
     if (f.hp <= 0){ f.ko = true; this.end(a); } return true;
@@ -694,33 +694,34 @@ const FightFactory = {
   },
   end(w){
     this.on = false; const A = AIPlayerFactory, B = AIPlayerFactory2, ws = BrainFactory.ws; BrainFactory.addLog(w.name + ' wins!');
-    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'fight_end', secs: Math.round(this.T), hp: [A.hp, B.hp], won: [w === A, w === B], hist: [A.hist.join(','), B.hist.join(',')] }));
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'fight_end', secs: Math.round(this.T), hp: [A.hp, B.hp], won: [w === A, w === B], hist: [A.hist.join(','), B.hist.join(',')], stats: [A.fs, B.fs] }));
     setTimeout(() => { if (!this.on) this.stop(); }, 5000);
   },
-  st(i){ const A = AIPlayerFactory, B = AIPlayerFactory2, f = i ? B : A, o = i ? A : B, r = n => +n.toFixed(1); return { me: { hp: f.hp, sta: Math.round(f.sta), x: r(f.x), z: r(f.z), doing: f.cur ? f.cur.t : 'idle', mode: f.tac.mode }, foe: { hp: o.hp, sta: Math.round(o.sta), x: r(o.x), z: r(o.z), doing: o.cur ? o.cur.t : 'idle', mode: o.tac.mode, dodges_vs_you: f.seen.dodge, blocks_vs_you: f.seen.block }, dist: r(Math.hypot(f.x - o.x, f.z - o.z)), secs: Math.round(this.T), recent: f.ev.splice(0) }; },
+  st(i){ const A = AIPlayerFactory, B = AIPlayerFactory2, f = i ? B : A, o = i ? A : B, r = n => +n.toFixed(1); return { me: { hp: f.hp, sta: Math.round(f.sta), x: r(f.x), z: r(f.z), doing: f.cur ? f.cur.t : 'idle', mode: f.tac.mode, stats: f.fs }, foe: { hp: o.hp, sta: Math.round(o.sta), x: r(o.x), z: r(o.z), doing: o.cur ? o.cur.t : 'idle', mode: o.tac.mode, dodges_vs_you: f.seen.dodge, blocks_vs_you: f.seen.block }, dist: r(Math.hypot(f.x - o.x, f.z - o.z)), secs: Math.round(this.T), recent: f.ev.splice(0) }; },
   receive(m){
     const f = m.fid ? AIPlayerFactory2 : AIPlayerFactory; this.pend[m.fid ? 1 : 0] = 0;
-    if (m.status === 'ok' && this.on && !f.ko){ if (m.mood) f.mood = m.mood; if (m.tac) f.tac = m.tac; if (m.actions && m.actions.length && !f.stun && (!f.cur || ['walk', 'run', 'wait'].includes(f.cur.t))){ f.cur = null; f.queue.length = 0; f.do(m.actions); } }
+    if (m.status === 'ok' && this.on && !f.ko){ if (m.mood) f.mood = m.mood; if (m.tac) f.tac = m.tac; if (m.why && m.why !== f.why){ f.why = m.why; BrainFactory.last('Fighter ' + ((m.fid | 0) + 1) + ' plan: ' + m.why + (m.orders ? ' [' + m.orders + ' order(s)]' : '')); } if (m.actions && m.actions.length && !f.stun && (!f.cur || ['walk', 'run', 'wait'].includes(f.cur.t))){ f.cur = null; f.queue.length = 0; f.do(m.actions); } }
     else if (m.status === 'error') BrainFactory.last('FIGHT ERROR: ' + m.detail);
   },
   brain(f, o, d, dt){   // fast local brain (every frame): personality + health + stamina + what the foe keeps doing
-    const t = f.tac, P = f.pers, ux = (o.x - f.x) / (d || 1), uz = (o.z - f.z) / (d || 1), hpF = f.hp / 100, k = f.seen;
+    const t = f.tac, W = t.w || {}, P = f.pers, ux = (o.x - f.x) / (d || 1), uz = (o.z - f.z) / (d || 1), hpF = f.hp / 100, k = f.seen;
     const away = () => { f.dash = { vx: -ux * 4.5, vz: -uz * 4.5, t: 0.3 }; }, side = () => { const s = Math.random() < 0.5 ? 1 : -1; f.dash = { vx: -uz * s * 2.6, vz: ux * s * 2.6, t: 0.35 }; };
     f.cd = Math.max(0, f.cd - dt); if (f.rec > 0 || f.stun > 0) return;   // recovering from a swing: cannot act (and is open to a counter)
     if (f.after){ const a = f.after; f.after = null; if (a === 'back'){ away(); return f.do([{ do: 'block', s: 0.7 }]); } f.cd = 0; }   // just got hit: back off and guard, or counter at once (courage decides)
     if (f.sta < 12){ if (d < 2.5) away(); return; }   // gassed: step back and catch breath (blocking would drain even more)
-    if ((f.emT -= dt) <= 0){ f.emT = 1.5; f.em = t.mode; if (hpF < 0.3 && P.courage < 0.65 && f.em === 'melee' && Math.random() < 0.6) f.em = 'defend'; if (hpF < 0.2 && o.hp > f.hp) f.em = Math.random() < P.courage * 0.6 ? 'wild' : 'retreat'; if (o.hp < 30 && hpF > 0.5 && f.em === 'defend') f.em = 'melee'; }
-    const q = this.quiet || 0, mode = (q > 8 || (q > 5 && (f.em || t.mode) === 'defend') || (q > 3 && (f.em || t.mode) === 'retreat' && hpF > 0.2)) ? 'melee' : (f.em || t.mode),   // nothing landed for a while: stop turtling / running, go fight
-     atk = () => { const hw = 0.15 + (k.block > k.dodge + 1 ? 0.4 : 0) + (o.sta < 20 ? 0.3 : 0); return f.sta > 22 && Math.random() < hw ? 'heavy' : 'punch'; };   // blocked a lot -> guard-breaking heavy
+    if ((f.emT -= dt) <= 0){ f.emT = 1.5; f.em = t.mode; if (!t.hold){ if (hpF < 0.3 && P.courage < 0.65 && f.em === 'melee' && Math.random() < 0.6) f.em = 'defend'; if (hpF < 0.2 && o.hp > f.hp) f.em = Math.random() < P.courage * 0.6 ? 'wild' : 'retreat'; if (o.hp < 30 && hpF > 0.5 && f.em === 'defend') f.em = 'melee'; } }
+    const q = this.quiet || 0, mode = t.hold ? (f.em || t.mode) : ((q > 8 || (q > 5 && (f.em || t.mode) === 'defend') || (q > 3 && (f.em || t.mode) === 'retreat' && hpF > 0.2)) ? 'melee' : (f.em || t.mode)),   // (standing orders = hold: no auto-override) nothing landed for a while: stop turtling / running, go fight
+     atk = () => { const wp = W.punch === undefined ? 1 : W.punch, wh = W.heavy === undefined ? 1 : W.heavy; if (wp < 0.05 && wh < 0.05) return null; if (wp < 0.05) return f.sta > 22 ? 'heavy' : null; if (wh < 0.05) return 'punch'; let hw = (0.15 + (k.block > k.dodge + 1 ? 0.4 : 0) + (o.sta < 20 ? 0.3 : 0)) * wh + (1 - wp) * 0.5; hw = Math.max(0, Math.min(1, hw)); return f.sta > 22 && Math.random() < hw ? 'heavy' : 'punch'; }, go = () => { const a = atk(); if (a) f.do([{ do: a }]); };   // his AI-set weights decide which attacks he uses (0 = never)   // blocked a lot -> guard-breaking heavy
     if (mode === 'retreat') return f.do([{ do: 'run', x: f.x - ux * 9, z: f.z - uz * 9 }]);
     if (mode === 'gun'){
-      if (d < 4.5) return away(); if (d > 11) return f.do([{ do: 'run', x: o.x - ux * 8, z: o.z - uz * 8 }]);
+      const lo = t.range ? t.range - 2 : 4.5, hi = t.range ? t.range + 3 : 11; if (d < lo) return away(); if (d > hi) return f.do([{ do: 'run', x: o.x - ux * (hi - 3), z: o.z - uz * (hi - 3) }]);
       if (f.cd <= 0){ f.cd = (0.8 + Math.random() * 0.5) * P.pace + 0.3; return f.do([{ do: 'shoot' }]); } if (Math.random() < dt * 0.8) side(); return;
     }
-    if (mode === 'defend'){ if (o.rec > 0 && d < 1.8) return f.do([{ do: atk() }]); if (d < 2.4) return f.do([{ do: 'block', s: 0.9 }]); if (d > 2.4) return f.do([{ do: 'walk', x: o.x - ux * 1.2, z: o.z - uz * 1.2 }]); return; }
+    if (mode === 'defend'){ if (o.rec > 0 && d < 1.8) return go(); if (d < 2.4) return f.do([{ do: 'block', s: 0.9 }]); if (d > 2.4) return f.do([{ do: 'walk', x: o.x - ux * 1.2, z: o.z - uz * 1.2 }]); return; }
     if (mode === 'wild') return d > 1.6 ? f.do([{ do: 'run', x: o.x, z: o.z }]) : f.do([{ do: 'heavy' }]);
+    if ((W.shoot || 0) > 0 && d > 2.2 && d < 12 && f.cd <= 0 && f.sta > 10 && Math.random() < W.shoot){ f.cd = (0.8 + Math.random() * 0.5) * P.pace + 0.3; return f.do([{ do: 'shoot' }]); }   // gun weight inside melee mode
     if (d > 1.8) return f.do([{ do: t.aggr > 0.5 ? 'run' : 'walk', x: o.x - ux * 0.9, z: o.z - uz * 0.9 }]);   // walk in to ~1.3 m, attack from <= 1.8 m (hit range is 1.9)
-    if (o.rec > 0 || f.cd <= 0){ f.cd = (0.5 + Math.random() * 0.5) * P.pace + 0.2 + (1 - t.aggr) * 0.4; return f.do([{ do: atk() }]); }   // swings at once when the foe is recovering
+    if (o.rec > 0 || f.cd <= 0){ f.cd = (0.5 + Math.random() * 0.5) * P.pace + 0.2 + (1 - t.aggr) * 0.4; return go(); }   // swings at once when the foe is recovering
     if (Math.random() < dt * 1.2) Math.random() < 0.5 ? side() : away();   // footwork: circle or step out of range
   },
   update(dt){
