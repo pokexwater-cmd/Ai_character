@@ -509,21 +509,25 @@ const RigFactory = {
    ===================================================================== */
 const AIPlayerFactory = {
   x: 0, z: 0, hop: 0, hist: [], heading: 0, clip: 'idle', mood: 'neutral', turnRate: 5, roam: 58, queue: [], cur: null,
+  rec: [],
+  note(s){ this.rec.push({ t: performance.now() / 1000, s }); if (this.rec.length > 10) this.rec.shift(); },   // RECEIPTS: what the body REALLY did (the brain reads these, so it cannot claim things that never happened)
+  recs(){ const n = performance.now() / 1000; return this.rec.map(r => Math.round(n - r.t) + 's ago: ' + r.s); },
+  tgt(n){ return n === 'player' ? CameraFactory.camera.position : n === 'rival' ? (this === AIPlayerFactory ? AIPlayerFactory2 : AIPlayerFactory) : null; },
   do(list){ for (const a of list || []) this.queue.push(a); },
   clear(){ this.queue.length = 0; this.cur = null; },
   busy(){ return !!this.cur || this.queue.length > 0; },
   lbl(t){ if (t !== this._l){ this._l = t; (this._e = this._e || document.getElementById('aiState')).textContent = t; } },   // DOM text only when it changes
   begin(a){
-    const cam = CameraFactory.camera.position; this.hist = this.hist.concat(a.do).slice(-5); if (this.fs && FightFactory.on) this.fs.use[a.do] = (this.fs.use[a.do] || 0) + 1;   // fight stats: what he really DID
+    const cam = CameraFactory.camera.position; this.hist = this.hist.concat(a.do).slice(-5); if (this.fs && FightFactory.on) this.fs.use[a.do] = (this.fs.use[a.do] || 0) + 1; if (!FightFactory.on || ['punch', 'heavy', 'shoot', 'block', 'dodge', 'jump'].includes(a.do)) this.note('started ' + a.do + (a.to ? ' toward the ' + a.to : '') + (a.at ? ' at the ' + a.at : ''));   // fight stats: what he really DID
     if (a.do === 'spin'){ const d = Math.max(-720, Math.min(720, +a.deg || 360)); this.cur = { t: 'spin', rem: Math.abs(d) * Math.PI / 180, sg: d < 0 ? -1 : 1, left: 9 }; }
     else if (a.do === 'jump') this.cur = { t: 'jump', left: 0.7, T: 0.7 };
-    else if (a.do === 'punch' || a.do === 'heavy' || a.do === 'shoot'){ const cost = { punch: 8, heavy: 18, shoot: 5 }[a.do]; if (this.sta !== undefined){ if (this.sta < cost){ this.cur = { t: 'wait', left: 0.4 }; return; } this.sta -= cost; } this.cur = a.do === 'punch' ? { t: 'punch', left: 0.4, hit: false } : a.do === 'heavy' ? { t: 'heavy', left: 0.9, hit: false } : { t: 'shoot', left: 0.4, fired: false }; }
+    else if (a.do === 'punch' || a.do === 'heavy' || a.do === 'shoot'){ const cost = { punch: 8, heavy: 18, shoot: 5 }[a.do]; if (this.sta !== undefined){ if (this.sta < cost){ this.cur = { t: 'wait', left: 0.4 }; this.note('FAILED ' + a.do + ': not enough stamina (' + Math.round(this.sta) + ' < ' + cost + ')'); return; } this.sta -= cost; } this.cur = a.do === 'punch' ? { t: 'punch', left: 0.4, hit: false } : a.do === 'heavy' ? { t: 'heavy', left: 0.9, hit: false } : { t: 'shoot', left: 0.4, fired: false }; }
     else if (a.do === 'dodge'){ FightFactory.dodge(this); this.cur = { t: 'wait', left: 0.3 }; }
     else if (a.do === 'block') this.cur = { t: 'block', left: Math.min(2, +a.s || 1.2) };
     else if (a.do === 'move'){ const nm = 'ai_' + String(a.name || 'move'); HumanMotion.clips[nm] = Object.assign({}, HumanMotion.clips.idle, a.p || {}); this.cur = { t: 'clip', name: nm, left: Math.min(10, +a.s || 3) }; }   // any body motion the AI invents = a clip of motion numbers
-    else if (a.do === 'walk' || a.do === 'run'){ const r = Math.hypot(a.x, a.z), k = r > this.roam ? this.roam / r : 1; this.cur = { t: a.do, x: a.x * k, z: a.z * k, left: 25 }; }
+    else if (a.do === 'walk' || a.do === 'run'){ let tx = a.x, tz = a.z; const T = this.tgt(a.to); if (T){ const dx = T.x - this.x, dz = T.z - this.z, d = Math.hypot(dx, dz) || 1, g = a.gap === undefined ? 2 : a.gap; tx = T.x - dx / d * g; tz = T.z - dz / d * g; } const r = Math.hypot(tx, tz), k = r > this.roam ? this.roam / r : 1; this.cur = { t: a.do, x: tx * k, z: tz * k, left: 25 }; }   // x,z OR to:'rival'/'player' (+ gap = how far to stop short)
     else if (a.do === 'come'){ const dx = cam.x - this.x, dz = cam.z - this.z, d = Math.hypot(dx, dz) || 1; this.cur = { t: a.run ? 'run' : 'walk', x: cam.x - dx / d * 1.8, z: cam.z - dz / d * 1.8, left: 25 }; }
-    else if (a.do === 'face') this.cur = { t: 'face', left: 1.2 };
+    else if (a.do === 'face') this.cur = { t: 'face', left: 1.2, at: a.at };
     else if (a.do === 'turn') this.cur = { t: 'turn', to: this.heading + (+a.deg || 0) * Math.PI / 180, left: 2.5 };
     else if (a.do === 'wait') this.cur = { t: 'wait', left: Math.min(10, +a.s || 1) };
     else if (a.do === 'emote') this.mood = a.mood || 'neutral';
@@ -535,11 +539,11 @@ const AIPlayerFactory = {
     const c = this.cur, cam = CameraFactory.camera.position; this.clip = 'idle'; this.hop = 0;
     if (this.dash && this.dash.t > 0){ this.x += this.dash.vx * dt; this.z += this.dash.vz * dt; this.dash.t -= dt; this.dashing = true; } else this.dashing = false;   // side-step / back-step / knock-back
     if (this.ko){ this.clip = 'ai_ko'; this.cur = null; this.queue.length = 0; return; }
-    if (this.stun > 0){ this.stun -= dt; this.cur = null; this.queue.length = 0; this.clip = 'ai_stun'; return; }   // hit-stun: cannot act
+    if (this.stun > 0){ if (this.queue.length) this.note('cancelled ' + this.queue.length + ' queued action(s): got hit'); this.stun -= dt; this.cur = null; this.queue.length = 0; this.clip = 'ai_stun'; return; }   // hit-stun: cannot act
     if (c){
       c.left -= dt;
       if (c.left <= 0) this.cur = null;
-      else if (c.t === 'face') this.turn(Math.atan2(cam.x - this.x, cam.z - this.z), dt);
+      else if (c.t === 'face'){ const T = this.tgt(c.at) || cam; this.turn(Math.atan2(T.x - this.x, T.z - this.z), dt); }
       else if (c.t === 'turn'){ if (this.turn(c.to, dt) < 0.04) this.cur = null; }
       else if (c.t === 'spin'){ const st = Math.min(c.rem, 6 * dt); this.heading += c.sg * st; c.rem -= st; if (c.rem < 0.01) this.cur = null; }   // a real full circle (turn can't: it takes the shortest way)
       else if (c.t === 'jump') this.hop = Math.sin(Math.PI * (1 - c.left / c.T)) * 0.9;
@@ -547,7 +551,7 @@ const AIPlayerFactory = {
       else if (c.t === 'punch'){ this.clip = 'ai_punch'; if (!c.hit && c.left < 0.2){ c.hit = true; FightFactory.hit(this, 'light'); } }
       else if (c.t === 'heavy'){ this.clip = c.left > 0.4 ? 'ai_wind' : 'ai_heavy'; if (c.left < 0.4 && c.left > 0.25){ this.x += Math.sin(this.heading) * 1.4 * dt; this.z += Math.cos(this.heading) * 1.4 * dt; } if (!c.hit && c.left < 0.25){ c.hit = true; FightFactory.hit(this, 'heavy'); } }   // heavy = visible wind-up (the foe can see it coming), then a big hit
       else if (c.t === 'block') this.clip = 'ai_block';
-      else if (c.t === 'shoot'){ this.clip = 'ai_shoot'; if (!c.fired && c.left < 0.25){ c.fired = true; FightFactory.shoot(this); } }
+      else if (c.t === 'shoot'){ this.clip = 'ai_shoot'; if (!FightFactory.on){ const R = this.tgt('rival'); this.turn(Math.atan2(R.x - this.x, R.z - this.z), dt); } if (!c.fired && c.left < 0.25){ c.fired = true; FightFactory.shoot(this); if (!FightFactory.on) this.note('bullet fired toward the rival (practice: no damage outside a fight)'); } }
       else if (c.t !== 'wait'){
         const dx = c.x - this.x, dz = c.z - this.z;
         if (Math.hypot(dx, dz) < 0.4) this.cur = null;
@@ -608,9 +612,15 @@ const BrainFactory = {
     ws.onmessage = e => { try { this.receive(JSON.parse(e.data)); } catch (x) {} };
     ws.onclose = () => { this.pending = false; this.status('reconnecting'); setTimeout(() => this.connect(), 4000); };
   },
-  state(){
-    const cam = CameraFactory.camera.position, ai = AIPlayerFactory, f = n => +n.toFixed(1);
-    return { me: { x: f(ai.x), z: f(ai.z), doing: ai.cur ? ai.cur.t : 'idle', mood: ai.mood, last: ai.hist.join(',') }, player: { x: f(cam.x), z: f(cam.z) }, dist: f(Math.hypot(cam.x - ai.x, cam.z - ai.z)), bounds: ai.roam };
+  state(){   // EVERYTHING the game knows, for the brain: him, the Rival, the player, the field, the fight, and receipts of what his body really did
+    const cam = CameraFactory.camera.position, ai = AIPlayerFactory, R = AIPlayerFactory2, FF = FightFactory, f = n => +n.toFixed(1), dist = (a, b) => f(Math.hypot(a.x - b.x, a.z - b.z)), off = (a, b) => { const w = Math.atan2(b.x - a.x, b.z - a.z), d = Math.atan2(Math.sin(w - a.heading), Math.cos(w - a.heading)); return Math.round(d * 180 / Math.PI); };
+    return {
+      me: { x: f(ai.x), z: f(ai.z), hp: ai.hp, sta: Math.round(ai.sta || 0), doing: ai.cur ? ai.cur.t : 'idle', mood: ai.mood, last: ai.hist.join(','), queued: ai.queue.map(a => a.do).join(','), receipts: ai.recs(), pistol: true },
+      rival: { x: f(R.x), z: f(R.z), hp: R.hp, sta: Math.round(R.sta || 0), doing: R.cur ? R.cur.t : 'idle', dist_from_you: dist(ai, R), you_are_facing_off_by_deg: off(ai, R) },
+      player: { x: f(cam.x), z: f(cam.z), dist_from_you: dist(ai, cam) },
+      dist: dist(ai, cam), fight: { on: FF.on, secs: Math.round(FF.T || 0) }, bounds: ai.roam,
+      field: 'flat open grass, no walls or obstacles, x and z from -' + ai.roam + ' to ' + ai.roam
+    };
   },
   addLog(s){ const l = this.log; l.style.display = 'block'; const d = document.createElement('div'); d.textContent = s; l.appendChild(d); while (l.children.length > 4) l.removeChild(l.firstChild); },
   submit(t){
@@ -667,7 +677,7 @@ const FightFactory = {
   snd(fr, du, ty){ try { const A = this.ac || (this.ac = new (window.AudioContext || window.webkitAudioContext)()), o = A.createOscillator(), g = A.createGain(); o.type = ty || 'sine'; o.frequency.value = fr; g.gain.value = 0.07; o.connect(g); g.connect(A.destination); o.start(); g.gain.exponentialRampToValueAtTime(0.0001, A.currentTime + du); o.stop(A.currentTime + du); } catch (e) {} },
   start(){ const A = AIPlayerFactory, B = AIPlayerFactory2; B.x = A.x + 4; B.z = A.z; A.heading = Math.PI / 2; B.heading = -Math.PI / 2; this.reset(); this.on = true; this.T = 0; this.tk = [0, 1.2]; this.pend = [0, 0]; BrainFactory.addLog('FIGHT!'); },
   reset(){
-    [AIPlayerFactory, AIPlayerFactory2].forEach((f, i) => Object.assign(f, { hp: 100, sta: 100, ko: false, flash: 0, inv: 0, cd: 0.4 + i * 0.5, dcd: 0, rec: 0, stun: 0, dash: null, cur: null, mood: 'neutral', pr: null, after: null, em: null, emT: 0, ev: [], seen: { dodge: 0, block: 0, hit: 0 }, fs: { use: {}, hit: {}, dmg: {}, blk: 0, taken: 0 }, pers: this.PERS[i], tac: i ? { mode: 'melee', aggr: 0.85, dodge: 0.3, w: {}, range: null, hold: false } : { mode: 'melee', aggr: 0.5, dodge: 0.6, w: {}, range: null, hold: false } }, { queue: [] }));
+    [AIPlayerFactory, AIPlayerFactory2].forEach((f, i) => Object.assign(f, { hp: 100, sta: 100, ko: false, flash: 0, inv: 0, cd: 0.4 + i * 0.5, dcd: 0, rec: 0, stun: 0, dash: null, cur: null, mood: 'neutral', pr: null, after: null, em: null, emT: 0, ev: [], seen: { dodge: 0, block: 0, hit: 0 }, fs: { use: {}, hit: {}, dmg: {}, blk: 0, taken: 0 }, rec: [], pers: this.PERS[i], tac: i ? { mode: 'melee', aggr: 0.85, dodge: 0.3, w: {}, range: null, hold: false } : { mode: 'melee', aggr: 0.5, dodge: 0.6, w: {}, range: null, hold: false } }, { queue: [] }));
     this.bl.forEach(b => { b.on = false; b.m.visible = false; });
   },
   stop(){ this.on = false; this.reset(); },
@@ -697,7 +707,7 @@ const FightFactory = {
     if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'fight_end', secs: Math.round(this.T), hp: [A.hp, B.hp], won: [w === A, w === B], hist: [A.hist.join(','), B.hist.join(',')], stats: [A.fs, B.fs] }));
     setTimeout(() => { if (!this.on) this.stop(); }, 5000);
   },
-  st(i){ const A = AIPlayerFactory, B = AIPlayerFactory2, f = i ? B : A, o = i ? A : B, r = n => +n.toFixed(1); return { me: { hp: f.hp, sta: Math.round(f.sta), x: r(f.x), z: r(f.z), doing: f.cur ? f.cur.t : 'idle', mode: f.tac.mode, stats: f.fs }, foe: { hp: o.hp, sta: Math.round(o.sta), x: r(o.x), z: r(o.z), doing: o.cur ? o.cur.t : 'idle', mode: o.tac.mode, dodges_vs_you: f.seen.dodge, blocks_vs_you: f.seen.block }, dist: r(Math.hypot(f.x - o.x, f.z - o.z)), secs: Math.round(this.T), recent: f.ev.splice(0) }; },
+  st(i){ const A = AIPlayerFactory, B = AIPlayerFactory2, f = i ? B : A, o = i ? A : B, r = n => +n.toFixed(1); return { me: { hp: f.hp, sta: Math.round(f.sta), x: r(f.x), z: r(f.z), doing: f.cur ? f.cur.t : 'idle', mode: f.tac.mode, stats: f.fs, tactic: f.tac, last_actions: f.hist.join(','), receipts: f.recs() }, foe: { hp: o.hp, sta: Math.round(o.sta), x: r(o.x), z: r(o.z), doing: o.cur ? o.cur.t : 'idle', mode: o.tac.mode, dodges_vs_you: f.seen.dodge, blocks_vs_you: f.seen.block, stats: o.fs, tactic: o.tac }, field: { half_size: AIPlayerFactory.roam, note: 'flat open grass, no obstacles' }, player: { x: r(CameraFactory.camera.position.x), z: r(CameraFactory.camera.position.z), note: 'a spectator, cannot be hurt' }, bullets_in_air: { mine: this.bl.filter(b => b.on && b.own === f).length, his: this.bl.filter(b => b.on && b.own === o).length }, dist: r(Math.hypot(f.x - o.x, f.z - o.z)), secs: Math.round(this.T), recent: f.ev.splice(0) }; },
   receive(m){
     const f = m.fid ? AIPlayerFactory2 : AIPlayerFactory; this.pend[m.fid ? 1 : 0] = 0;
     if (m.status === 'ok' && this.on && !f.ko){ if (m.mood) f.mood = m.mood; if (m.tac) f.tac = m.tac; if (m.why && m.why !== f.why){ f.why = m.why; BrainFactory.last('Fighter ' + ((m.fid | 0) + 1) + ' plan: ' + m.why + (m.orders ? ' [' + m.orders + ' order(s)]' : '')); } if (m.actions && m.actions.length && !f.stun && (!f.cur || ['walk', 'run', 'wait'].includes(f.cur.t))){ f.cur = null; f.queue.length = 0; f.do(m.actions); } }
@@ -735,7 +745,7 @@ const FightFactory = {
       if (near && f.inv > 0 && !b.dodged){ b.dodged = true; b.own.seen.dodge++; this.note(f, 'you dodged a bullet'); this.note(b.own, 'he dodged your bullet'); }
       else if (near && f.inv <= 0){ this.dmg(b.own, f, 10, 'bullet'); b.life = 0; }
       if (b.life <= 0){ b.on = false; b.m.visible = false; } }
-    if (!this.on) return; this.T += dt; this.quiet = (this.quiet || 0) + dt;
+    if (!this.on){ for (const f of [A, B]) f.sta = Math.min(100, (f.sta || 0) + 20 * dt); return; } this.T += dt; this.quiet = (this.quiet || 0) + dt;
     { const dx = B.x - A.x, dz = B.z - A.z, dd = Math.hypot(dx, dz); if (dd < 0.8 && dd > 0.001){ const pu = (0.8 - dd) / 2; A.x -= dx / dd * pu; A.z -= dz / dd * pu; B.x += dx / dd * pu; B.z += dz / dd * pu; } }   // they cannot stand inside each other
     [A, B].forEach((f, i) => {
       const o = i ? A : B, d = Math.hypot(o.x - f.x, o.z - f.z), act = f.cur && f.cur.t;
