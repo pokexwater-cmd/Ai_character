@@ -675,7 +675,7 @@ const FightFactory = {
   dmg(a, f, n, kind){   // the ONE place damage is applied
     if (!this.on || f.ko || f.inv > 0) return false;
     const bl = f.cur && f.cur.t === 'block' && f.sta > 0; let m = bl ? (kind === 'heavy' ? 0.6 : kind === 'bullet' ? 0.4 : 0.15) : 1; if (f.rec > 0 && !bl) m *= 1.3;   // a foe who just swung is open to a counter
-    const v = Math.max(1, Math.round(n * m)); f.hp = Math.max(0, f.hp - v); f.flash = bl ? 0.12 : 0.45; this.hs = bl ? 0.03 : 0.07; this.snd(bl ? 300 : 110, 0.08, bl ? 'square' : 'sine');
+    this.quiet = 0; const v = Math.max(1, Math.round(n * m)); f.hp = Math.max(0, f.hp - v); f.flash = bl ? 0.12 : 0.45; this.hs = bl ? 0.03 : 0.07; this.snd(bl ? 300 : 110, 0.08, bl ? 'square' : 'sine');
     if (bl){ a.seen.block++; this.note(a, 'he blocked your ' + kind); this.note(f, 'you blocked a ' + kind); f.sta = Math.max(0, f.sta - (kind === 'heavy' ? 25 : 6)); if (kind === 'heavy'){ f.cur = null; f.stun = 0.3; } }
     else { a.seen.hit++; this.note(a, 'you landed a ' + kind + ' (' + v + ')'); this.note(f, 'you took a ' + kind + ' (' + v + ')'); f.cur = null; f.queue.length = 0; f.stun = kind === 'heavy' ? 0.5 : 0.3; f.dash = { vx: Math.sin(a.heading) * 3.5, vz: Math.cos(a.heading) * 3.5, t: 0.18 }; f.after = Math.random() < f.pers.courage && f.hp > 30 ? 'counter' : 'back'; }
     if (f.hp <= 0){ f.ko = true; this.end(a); } return true;
@@ -700,7 +700,7 @@ const FightFactory = {
   st(i){ const A = AIPlayerFactory, B = AIPlayerFactory2, f = i ? B : A, o = i ? A : B, r = n => +n.toFixed(1); return { me: { hp: f.hp, sta: Math.round(f.sta), x: r(f.x), z: r(f.z), doing: f.cur ? f.cur.t : 'idle', mode: f.tac.mode }, foe: { hp: o.hp, sta: Math.round(o.sta), x: r(o.x), z: r(o.z), doing: o.cur ? o.cur.t : 'idle', mode: o.tac.mode, dodges_vs_you: f.seen.dodge, blocks_vs_you: f.seen.block }, dist: r(Math.hypot(f.x - o.x, f.z - o.z)), secs: Math.round(this.T), recent: f.ev.splice(0) }; },
   receive(m){
     const f = m.fid ? AIPlayerFactory2 : AIPlayerFactory; this.pend[m.fid ? 1 : 0] = 0;
-    if (m.status === 'ok' && this.on && !f.ko){ if (m.mood) f.mood = m.mood; if (m.tac) f.tac = m.tac; if (m.say) BrainFactory.addLog(f.name + ': ' + m.say); if (m.actions && m.actions.length && !f.stun){ f.cur = null; f.queue.length = 0; f.do(m.actions); } }
+    if (m.status === 'ok' && this.on && !f.ko){ if (m.mood) f.mood = m.mood; if (m.tac) f.tac = m.tac; if (m.actions && m.actions.length && !f.stun && (!f.cur || ['walk', 'run', 'wait'].includes(f.cur.t))){ f.cur = null; f.queue.length = 0; f.do(m.actions); } }
     else if (m.status === 'error') BrainFactory.last('FIGHT ERROR: ' + m.detail);
   },
   brain(f, o, d, dt){   // fast local brain (every frame): personality + health + stamina + what the foe keeps doing
@@ -710,15 +710,16 @@ const FightFactory = {
     if (f.after){ const a = f.after; f.after = null; if (a === 'back'){ away(); return f.do([{ do: 'block', s: 0.7 }]); } f.cd = 0; }   // just got hit: back off and guard, or counter at once (courage decides)
     if (f.sta < 12){ if (d < 2.5) away(); return; }   // gassed: step back and catch breath (blocking would drain even more)
     if ((f.emT -= dt) <= 0){ f.emT = 1.5; f.em = t.mode; if (hpF < 0.3 && P.courage < 0.65 && f.em === 'melee' && Math.random() < 0.6) f.em = 'defend'; if (hpF < 0.2 && o.hp > f.hp) f.em = Math.random() < P.courage * 0.6 ? 'wild' : 'retreat'; if (o.hp < 30 && hpF > 0.5 && f.em === 'defend') f.em = 'melee'; }
-    const mode = f.em || t.mode, atk = () => { const hw = 0.15 + (k.block > k.dodge + 1 ? 0.4 : 0) + (o.sta < 20 ? 0.3 : 0); return f.sta > 22 && Math.random() < hw ? 'heavy' : 'punch'; };   // blocked a lot -> guard-breaking heavy
+    const q = this.quiet || 0, mode = (q > 8 || (q > 5 && (f.em || t.mode) === 'defend') || (q > 3 && (f.em || t.mode) === 'retreat' && hpF > 0.2)) ? 'melee' : (f.em || t.mode),   // nothing landed for a while: stop turtling / running, go fight
+     atk = () => { const hw = 0.15 + (k.block > k.dodge + 1 ? 0.4 : 0) + (o.sta < 20 ? 0.3 : 0); return f.sta > 22 && Math.random() < hw ? 'heavy' : 'punch'; };   // blocked a lot -> guard-breaking heavy
     if (mode === 'retreat') return f.do([{ do: 'run', x: f.x - ux * 9, z: f.z - uz * 9 }]);
     if (mode === 'gun'){
       if (d < 4.5) return away(); if (d > 11) return f.do([{ do: 'run', x: o.x - ux * 8, z: o.z - uz * 8 }]);
       if (f.cd <= 0){ f.cd = (0.8 + Math.random() * 0.5) * P.pace + 0.3; return f.do([{ do: 'shoot' }]); } if (Math.random() < dt * 0.8) side(); return;
     }
-    if (mode === 'defend'){ if (o.rec > 0 && d < 1.8) return f.do([{ do: atk() }]); if (d < 2.4) return f.do([{ do: 'block', s: 0.9 }]); if (d > 3.2) return f.do([{ do: 'walk', x: o.x - ux * 2, z: o.z - uz * 2 }]); return; }
-    if (mode === 'wild') return d > 1.5 ? f.do([{ do: 'run', x: o.x, z: o.z }]) : f.do([{ do: 'heavy' }]);
-    if (d > 1.6) return f.do([{ do: t.aggr > 0.5 ? 'run' : 'walk', x: o.x - ux * 1.3, z: o.z - uz * 1.3 }]);
+    if (mode === 'defend'){ if (o.rec > 0 && d < 1.8) return f.do([{ do: atk() }]); if (d < 2.4) return f.do([{ do: 'block', s: 0.9 }]); if (d > 2.4) return f.do([{ do: 'walk', x: o.x - ux * 1.2, z: o.z - uz * 1.2 }]); return; }
+    if (mode === 'wild') return d > 1.6 ? f.do([{ do: 'run', x: o.x, z: o.z }]) : f.do([{ do: 'heavy' }]);
+    if (d > 1.8) return f.do([{ do: t.aggr > 0.5 ? 'run' : 'walk', x: o.x - ux * 0.9, z: o.z - uz * 0.9 }]);   // walk in to ~1.3 m, attack from <= 1.8 m (hit range is 1.9)
     if (o.rec > 0 || f.cd <= 0){ f.cd = (0.5 + Math.random() * 0.5) * P.pace + 0.2 + (1 - t.aggr) * 0.4; return f.do([{ do: atk() }]); }   // swings at once when the foe is recovering
     if (Math.random() < dt * 1.2) Math.random() < 0.5 ? side() : away();   // footwork: circle or step out of range
   },
@@ -733,7 +734,8 @@ const FightFactory = {
       if (near && f.inv > 0 && !b.dodged){ b.dodged = true; b.own.seen.dodge++; this.note(f, 'you dodged a bullet'); this.note(b.own, 'he dodged your bullet'); }
       else if (near && f.inv <= 0){ this.dmg(b.own, f, 10, 'bullet'); b.life = 0; }
       if (b.life <= 0){ b.on = false; b.m.visible = false; } }
-    if (!this.on) return; this.T += dt;
+    if (!this.on) return; this.T += dt; this.quiet = (this.quiet || 0) + dt;
+    { const dx = B.x - A.x, dz = B.z - A.z, dd = Math.hypot(dx, dz); if (dd < 0.8 && dd > 0.001){ const pu = (0.8 - dd) / 2; A.x -= dx / dd * pu; A.z -= dz / dd * pu; B.x += dx / dd * pu; B.z += dz / dd * pu; } }   // they cannot stand inside each other
     [A, B].forEach((f, i) => {
       const o = i ? A : B, d = Math.hypot(o.x - f.x, o.z - f.z), act = f.cur && f.cur.t;
       if (!f.ko && f.stun <= 0 && (!f.cur || act === 'punch' || act === 'heavy' || act === 'block' || act === 'wait' || act === 'shoot')) f.turn(Math.atan2(o.x - f.x, o.z - f.z), dt);   // keeps facing the foe
